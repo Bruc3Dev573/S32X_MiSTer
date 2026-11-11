@@ -62,7 +62,7 @@ module BA
 	input         Z80_MREQ_N,
 	input         Z80_M1_N,
 	output reg    Z80_WAIT_N,
-	//input         Z80_RFSH_N,
+	input         Z80_RFSH_N,
 	output reg    Z80_BUSRQ_N,
 	input         Z80_BUSAK_N,
 	output reg    Z80_RESET_N,
@@ -611,8 +611,9 @@ module BA
 	wire        Z80_ZBUS_SEL = Z80_ZBUS_AREA & Z80_IO;
 	wire        ZBUS_FREE = ~Z80_BUSRQ_N & Z80_RESET_N;
 	
-	wire        Z80_MBUS_SEL = ~Z80_MREQ_N & ~Z80_ZBUS_AREA;
-//	wire        Z80_MBUS_SEL = Z80_IO & ~Z80_ZBUS_AREA;
+	// A refresh cycle drives I:R with MREQ low but is not a memory access;
+	// with I >= 80h it must not start a 68K-bus cycle (WAIT would never be released).
+	wire        Z80_MBUS_SEL = ~Z80_MREQ_N & Z80_RFSH_N & ~Z80_ZBUS_AREA;
 	wire  [7:0] Z80_MBUS_D = Z80_A[0] ? MBUS_DI[7:0] : MBUS_DI[15:8];
 	
 	always @(posedge CLK) begin
