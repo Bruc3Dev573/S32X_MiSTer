@@ -1704,6 +1704,7 @@ module VDP
 		bit        SPR_COL_30, SPR_COL_31;
 		bit  [5:0] PAL_COL, PAL_COL_DBG;
 		bit        SPR_BORD;
+		bit        BACK;
 		PixMode_t  PIX_MODE_PIPE[3];
 		PixMode_t  PIX_MODE_TEMP;
 		bit  [8:0] PIX_COL_PIPE[2];
@@ -1772,6 +1773,7 @@ module VDP
 					SPR_COL_30 = (OBJL_Q[5:0] == 6'h3E);
 						
 					BACK_COL_PIPE[0] <= 0;
+					BACK = 0;
 					if      (SPR_COL != 4'b0000 &&  SPR_PRIO && (!MR4.STE || (!SPR_COL_30 && !SPR_COL_31)) && SPR_EN)
 						PAL_COL = {SPR_PAL,SPR_COL};
 					else if (BGA_COL != 4'b0000 &&  BGA_PRIO                                               && BGA_EN)
@@ -1786,6 +1788,7 @@ module VDP
 						PAL_COL = {BGB_PAL,BGB_COL};
 					else begin
 						PAL_COL = {BGC.PAL,BGC.COL};
+						BACK = 1;
 						BACK_COL_PIPE[0] <= 1;
 					end
 					
@@ -1796,7 +1799,7 @@ module VDP
 						PIX_MODE_TEMP = PIX_NORMAL;
 					
 					PIX_MODE_PIPE[0] <= PIX_MODE_TEMP;
-					if (!DISP) begin
+					if (!DISP || DBG[6]) begin
 						PIX_MODE_PIPE[0] <= PIX_NORMAL;
 					end else if (MR4.STE && (SPR_PRIO || ((!BGA_PRIO || BGA_COL == 4'b0000) && (!BGB_PRIO || BGB_COL == 4'b0000)))) begin
 						//sprite is visible
@@ -1826,7 +1829,9 @@ module VDP
 					else if (DBG[6])
 						CRAM_ADDR_A <= PAL_COL_DBG;
 					else if (DBG[8:7] != 2'b00)
-						CRAM_ADDR_A <= PAL_COL & PAL_COL_DBG;
+						// masked mode: the forced plane is always active, so the backdrop never shows;
+						// where another plane shows, both drive the colour bus (AND)
+						CRAM_ADDR_A <= BACK ? PAL_COL_DBG : PAL_COL & PAL_COL_DBG;
 					else
 						CRAM_ADDR_A <= PAL_COL;
 					
