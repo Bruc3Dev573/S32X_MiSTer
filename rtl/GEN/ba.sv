@@ -437,7 +437,10 @@ module BA
 				end
 	
 			MBUS_RAM_REFRESH: begin
-					if (!rfs_ram_delay && M68K_CLKENp) begin
+					// A 68000 write only starts here once its data strobes are out, on the
+					// clock DTACK is sampled; waiting for the next 68000 edge would give RAM
+					// writes a wait state they don't have. Reads keep the edge alignment.
+					if (!rfs_ram_delay && (M68K_CLKENp || !MBUS_RNW)) begin
 						mstate <= MBUS_RAM_READ;
 					end
 				end
