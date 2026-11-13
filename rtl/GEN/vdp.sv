@@ -197,8 +197,11 @@ module VDP
 	wire        FIFO_EMPTY = FIFO.AMOUNT == 3'd0;
 	wire        FIFO_FULL = FIFO.AMOUNT[2];
 	
-	wire [16:0] FIFO_NEXT_ADDR = FIFO.ITEMS[FIFO.RD_POS + 1].ADDR;
-	wire [15:0] FIFO_NEXT_DATA = FIFO.ITEMS[FIFO.RD_POS + 1].DATA;
+	// The next item wraps in the 4-entry FIFO: "RD_POS + 1" is 32 bits wide and would
+	// index a fifth item after item 3.
+	wire  [1:0] FIFO_NEXT_POS = FIFO.RD_POS + 2'd1;
+	wire [16:0] FIFO_NEXT_ADDR = FIFO.ITEMS[FIFO_NEXT_POS].ADDR;
+	wire [15:0] FIFO_NEXT_DATA = FIFO.ITEMS[FIFO_NEXT_POS].DATA;
 	wire        FIFO_PRE_EMPTY = FIFO.AMOUNT == 3'd1;
 	
 	
