@@ -170,5 +170,33 @@ package S32X_PKG;
 	} FBCR_t;
 	parameter bit [15:0] FBCR_MASK = 16'h0001;
 	parameter bit [15:0] FBCR_INIT = 16'h0000;
-	
+
+	// Savestate image of the 32X module, in 32-bit words:
+	// [master SH-2][slave SH-2][adapter registers][VDP registers][palette][MD BIOS RAM words].
+	// The framebuffers and the 32X SDRAM are not in it (the top level saves them).
+	// Regions start on power-of-2 boundaries so a word index is the low address bits;
+	// the words in the gaps are reserved (read 0, writes ignored).
+	// Any change of this layout must bump the image version at the top level.
+	localparam int SS_SH_SIZE     = SH7604_PKG::SS_IMAGE_SIZE;
+	localparam int SS_SH_SLOT     = 1 << $clog2(SS_SH_SIZE);
+	localparam int SS_IF_SIZE     = 19;
+	localparam int SS_VDP_SIZE    = 3;
+	localparam int SS_PAL_SIZE    = 256;	// one palette entry per word, bits 15:0
+	localparam int SS_MDROM_SIZE  = 2;	// MD BIOS RAM bytes 70h-73h (68000 level 4 vector), bits 15:0
+	localparam int SS_RUN_SIZE    = 1;	// VCLKs the 32X ran after the 68000 parked, bits 15:0
+	localparam int SS_RC_SIZE     = 5;	// DDR3 read cache state (ddram.sv), answered by the top level
+
+	localparam int SS_OFF_MSH     = 0;
+	localparam int SS_OFF_SSH     = SS_SH_SLOT;
+	// Adapter block of 1024 words: adapter +000h, VDP +020h, SDRAM read cache +040h,
+	// palette +100h, MD BIOS +200h, park delay +202h. Word 0 of the read cache block has
+	// bit 31 set.
+	localparam int SS_OFF_IF      = 2*SS_SH_SLOT > 1024 ? 2*SS_SH_SLOT : 1024;
+	localparam int SS_OFF_VDP     = SS_OFF_IF + 'h020;
+	localparam int SS_OFF_RC      = SS_OFF_IF + 'h040;
+	localparam int SS_OFF_PAL     = SS_OFF_IF + 'h100;
+	localparam int SS_OFF_MDROM   = SS_OFF_IF + 'h200;
+	localparam int SS_OFF_RUN     = SS_OFF_IF + 'h202;
+	localparam int SS_32X_SIZE    = SS_OFF_RUN + SS_RUN_SIZE;
+
 endpackage

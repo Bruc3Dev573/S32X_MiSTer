@@ -18,7 +18,11 @@ module SH7604_UBC
 	output            IBUS_BUSY,
 	output            IBUS_ACT,
 	
-	output            IRQ
+	output            IRQ,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
@@ -38,6 +42,13 @@ module SH7604_UBC
 	BDMRB_t     BDMRBH;
 	BBRx_t      BBRB;
 	BRCR_t      BRCR;
+	
+	// Savestate chain: the writable register bits (the UBC only has register readback);
+	// REG_DO is dead at the park.
+`define SS_UBC_REG {BARAH, BARAL, BAMRAL, BAMRAH, BBRA[7:0], BARBH, BARBL, BAMRBL, BAMRBH, \
+                    BDRBH, BDRBL, BDMRBL, BDMRBH, BBRB[7:0], BRCR[15:12], BRCR[10], BRCR[7:6], BRCR[4], BRCR[2]}
+	wire [217+31:0] ss_reg = {`SS_UBC_REG, SS_SI};
+	assign SS_SO = ss_reg[217+31:217];
 	
 	wire REG_SEL = (IBUS_A >= 32'hFFFFFF40 && IBUS_A <= 32'hFFFFFF7C);
 	
@@ -61,6 +72,9 @@ module SH7604_UBC
 			BBRB <= BBRx_INIT;
 			BRCR <= BRCR_INIT;
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			`SS_UBC_REG <= ss_reg[216:0];
 		end
 		else if (EN && CE_R && !DISABLE) begin
 			if (!RES_N) begin
@@ -156,5 +170,6 @@ module SH7604_UBC
 	assign IBUS_DO = REG_SEL ? REG_DO : '0;
 	assign IBUS_BUSY = 0;
 	assign IBUS_ACT = REG_SEL;
+`undef SS_UBC_REG
 
 endmodule

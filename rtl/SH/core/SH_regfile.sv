@@ -15,7 +15,12 @@ module SH2_regfile (
 	output     [31:0] RA_Q,
 	input       [4:0] RB_ADDR,
 	output     [31:0] RB_Q,
-	output     [31:0] R0_Q
+	output     [31:0] R0_Q,
+	
+	// Savestate write of R0-R15 (SS_N 0-15) or PR (SS_N 16) while the CPU is parked
+	input             SS_WE,
+	input       [4:0] SS_N,
+	input      [31:0] SS_D
 
 `ifdef DEBUG
 	                  ,
@@ -39,9 +44,12 @@ module SH2_regfile (
 `endif
 );
 	
+	// Verilator ignores translate_off, so it skips this SIM define and builds the synthesis path.
+`ifndef VERILATOR
 	// synopsys translate_off
 	`define SIM
 	// synopsys translate_on
+`endif
 	
 `ifdef SIM
 
@@ -74,7 +82,7 @@ module SH2_regfile (
 			if (WAE && CE) begin
 				GR[WA_ADDR] <= WA_D;
 			end
-			if (WBE_SAVE) begin
+			if (WBE_LATCH) begin
 				GR[WB_ADDR_LATCH] <= WB_D_LATCH;
 			end
 		end
@@ -102,6 +110,8 @@ module SH2_regfile (
 	
 `else
 	
+	// The write-B latch also carries savestate writes: they reach both MLAB copies,
+	// PR and the R0 copy through the existing delayed-write path.
 	bit  [4:0] WB_ADDR_LATCH;
 	bit [31:0] WB_D_LATCH;
 	bit        WBE_LATCH;
@@ -117,6 +127,11 @@ module SH2_regfile (
 				WB_ADDR_LATCH <= WB_ADDR;
 				WB_D_LATCH <= WB_D;
 				WBE_LATCH <= WBE;
+			end
+			else if (SS_WE) begin
+				WB_ADDR_LATCH <= SS_N;
+				WB_D_LATCH <= SS_D;
+				WBE_LATCH <= 1;
 			end
 		end
 	end

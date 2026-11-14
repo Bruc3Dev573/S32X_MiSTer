@@ -30,7 +30,11 @@ module SH7604_FRT (
 	output            ICI_IRQ,
 	output            OCIA_IRQ,
 	output            OCIB_IRQ,
-	output            OVI_IRQ
+	output            OVI_IRQ,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
@@ -43,6 +47,17 @@ module SH7604_FRT (
 	FTCSR_t     FTCSR;
 	TCR_t       TCR;
 	TOCR_t      TOCR;
+	bit         OCFA_SET,OCFB_SET,OVF_SET;
+	bit [ 7: 0] TEMP;
+	
+	// Savestate chain: compare/overflow flags, registers, then SS_SI. The 32X leaves FTI,
+	// FTCI, FTOA, FTOB and the FRT bus wait unconnected, so the input capture (ICR, ICF,
+	// CAPT and its edge/read latches), FTOA/FTOB and BUSY are not saved; REG_DO is dead
+	// at the park.
+`define SS_FRT_FLG {FTCSR.OCFA, FTCSR.OCFB, FTCSR.OVF, OCFA_SET, OCFB_SET, OVF_SET}
+`define SS_FRT_REG {TIER[7:1], FRC, OCRA, OCRB, TCR.IEDG, TCR.CKS, TOCR[4:0], FTCSR.CCLRA, TEMP}
+	wire [ 6+31:0] ss_flg;
+	wire [72+31:0] ss_reg;
 	
 	//Clock selector
 	bit         FTCI_OLD;
@@ -64,12 +79,13 @@ module SH7604_FRT (
 	wire FTCSR_WRITE = REG_SEL && IBUS_A[3:0] == 4'h1 && IBUS_WE && IBUS_REQ;
 	wire FTCSR_READ = REG_SEL && IBUS_A[3:0] == 4'h1 && !IBUS_WE && IBUS_REQ;
 	always @(posedge CLK or negedge RST_N) begin
-		bit         OCFA_SET,OCFB_SET,OVF_SET;
-		
 		if (!RST_N) begin
 			FTCSR.OCFA <= 0;
 			FTCSR.OCFB <= 0;
 			FTCSR.OVF <= 0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_FRT_FLG <= ss_flg[5:0];
 		end
 		else if (CE_F) begin
 			if (!RES_N) begin
@@ -169,7 +185,6 @@ module SH7604_FRT (
 	assign OVI_IRQ = FTCSR.OVF & TIER.OVIE;
 	
 	//Registers
-	bit [ 7: 0] TEMP;
 	bit [ 7: 0] REG_DO;
 	bit         BUSY;
 	always @(posedge CLK or negedge RST_N) begin
@@ -189,6 +204,9 @@ module SH7604_FRT (
 			// synopsys translate_off
 			TEMP <= 8'h00;
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			`SS_FRT_REG <= ss_reg[71:0];
 		end
 		else if (CE_R) begin
 			if (FRC_CE) begin
@@ -248,6 +266,12 @@ module SH7604_FRT (
 	
 	assign IBUS_DO = REG_SEL ? {4{REG_DO}} : '0;
 	assign IBUS_BUSY = BUSY;
+	
+	assign ss_flg = {`SS_FRT_FLG, ss_reg[72+31:72]};
+	assign ss_reg = {`SS_FRT_REG, SS_SI};
+	assign SS_SO  = ss_flg[6+31:6];
+`undef SS_FRT_FLG
+`undef SS_FRT_REG
 	assign IBUS_ACT = REG_SEL;
 	
 endmodule

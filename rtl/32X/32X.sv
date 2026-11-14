@@ -69,21 +69,88 @@ module S32X
 	output     [15:0] PWM_L,
 	output     [15:0] PWM_R,
 	
-	output     [23:0] DBG_CA
+	output     [23:0] DBG_CA,
+
+	// 32X adapter enabled by the 68000 (ADCR.ADEN): a 32X game is running.
+	output            ADEN,
+	
+	// Savestate. The 32X parks on the VCLK where the 68000 does: SS_CAN_PARK tells the
+	// 68000 side that this VCLK finds both SH-2 buses at T0 and no SH-side adapter
+	// handshake open, and SS_PARK_ENGAGE (combinational, from gen) says the 68000 parks on
+	// it. The burst of that VCLK is then skipped, so no SH-2 clock runs between the two
+	// parks. SS_PARK_REQ (68000 parked) keeps every later VCLK blocked (SS_PARKED) until
+	// SS_RELEASE; if the 68000 is ever parked without the 32X, it also parks the 32X at the
+	// next suitable VCLK. The CE generator is then idle (CLK_CNT 7), so the next VCLK
+	// after the release starts a normal burst.
+	input             SS_PHASE_HOLD,	// raster-derived logic frozen (68000 park to release)
+	input             SS_PARK_REQ,
+	input             SS_PARK_ENGAGE,
+	output            SS_CAN_PARK,
+	input             SS_RELEASE,		// release clock: a VCLK on it passes
+	output            SS_PARKED,
+	output            SS_QUIET,			// adapter idle: no handshake in flight, VDP FIFO drained
+	input             SS_ACTIVE,		// everything parked: the image ports may be taken over
+	input             SS_SEL,
+	input      [15:0] SS_ADDR,			// word inside the S32X_PKG::SS_32X_SIZE image
+	input             SS_WR_EN,
+	input      [31:0] SS_WR_DATA,
+	output     [31:0] SS_RD_DATA		// valid 2 clocks after SS_ADDR changes
 );
 	import S32X_PKG::*;
+
+	bit         SS_PARK;
+	bit         MSH_SS_BUS_IDLE, SSH_SS_BUS_IDLE;
+	bit         IF_SS_SH_IDLE;
+	bit         IF_SS_QUIET, VDP_SS_QUIET;
+	bit   [2:0] CLK_CNT = 3'b111;
+	// Park on a VCLK that finds the CE generator idle and every SH-side bus quiet; the
+	// SH-2 flops are stable there (the last CE_R was at least 1 clock ago).
+	assign SS_CAN_PARK = VCLK & &CLK_CNT & MSH_SS_BUS_IDLE & SSH_SS_BUS_IDLE & IF_SS_SH_IDLE;
+	wire SS_REQ = SS_PARK_REQ | SS_PARK_ENGAGE;
+	wire SS_PARK_NOW = SS_REQ & SS_CAN_PARK;
+	wire SS_STOP = (SS_PARK | SS_PARK_NOW) & SS_REQ & ~SS_RELEASE;
+	always @(posedge CLK) begin
+		if (~RST_N) SS_PARK <= 0;
+		else        SS_PARK <= SS_STOP;
+	end
+	assign SS_PARKED = SS_PARK;
+
+	// The 68000 normally parks only on a VCLK where the 32X parks too. If it is ever parked
+	// without the 32X, the 32X parks at the next suitable VCLK; the VCLKs it ran in between
+	// (SS_RUN, saved with the image) are held back after the park ends (SS_SKIP), so the
+	// SH-2s keep their place in time.
+	bit  [15:0] SS_RUN, SS_SKIP;
+	bit         SS_PARK_REQ_D;
+	wire        SS_RUN_WE = SS_WR_EN & SS_SEL & SS_ADDR == 16'(SS_OFF_RUN);
+	wire        SS_SKIP_LOAD = SS_PARK_REQ_D & ~SS_PARK_REQ;
+	always @(posedge CLK) begin
+		if (~RST_N) begin
+			SS_RUN <= 0;
+			SS_SKIP <= 0;
+			SS_PARK_REQ_D <= 0;
+		end
+		else begin
+			SS_PARK_REQ_D <= SS_PARK_REQ;
+			if (SS_RUN_WE)                          SS_RUN <= SS_WR_DATA[15:0];
+			else if (!SS_PARK_REQ)                  SS_RUN <= 0;
+			else if (VCLK && !SS_STOP && !SS_PARK)  SS_RUN <= SS_RUN + 1'd1;
+
+			if (SS_SKIP_LOAD)                       SS_SKIP <= SS_RUN;
+			else if (VCLK && SS_SKIP)               SS_SKIP <= SS_SKIP - 1'd1;
+		end
+	end
+	wire VCLK_G = VCLK & ~SS_STOP & ~|SS_SKIP;
 
 	bit CE_R, CE_F;
 	// The SH2 clock ticks 3 full times for each VCLK
 	always @(posedge CLK) begin
-		bit [2:0] CLK_CNT = 3'b111;
 		if (~&CLK_CNT)
 			CLK_CNT <= CLK_CNT + 1'd1;
 
 		CE_F <= 0;
 		CE_R <= 0;
 	
-		if (VCLK) begin
+		if (VCLK_G) begin
 			CLK_CNT <= 1;
 			CE_F <= 1;
 		end
@@ -101,6 +168,24 @@ module S32X
 		if (~RST_N)
 			CLK_CNT <= 3'b111;
 	end
+	
+	// Image regions (S32X_PKG layout, power-of-2 aligned: word indices are low address
+	// bits). The selects of the read mux are registered: every region's data is valid 1
+	// (SH-2: up to 2) clocks after SS_ADDR changes anyway.
+	wire SS_BLK       = SS_SEL & SS_ADDR[15:10] == 6'(SS_OFF_IF >> 10);
+	wire SS_MSH_SEL   = SS_SEL & SS_ADDR < 16'(SS_SH_SIZE);
+	wire SS_SSH_SEL   = SS_SEL & SS_ADDR >= 16'(SS_OFF_SSH) & SS_ADDR < 16'(SS_OFF_SSH + SS_SH_SIZE);
+	wire SS_IF_SEL    = SS_BLK & SS_ADDR[9:5] == 5'h00;
+	wire SS_VDP_SEL   = SS_BLK & SS_ADDR[9:2] == 8'h08;
+	wire SS_PAL_SEL   = SS_BLK & SS_ADDR[9:8] == 2'h1;
+	wire SS_MDROM_SEL = SS_BLK & SS_ADDR[9:1] == 9'h100;
+	wire SS_RUN_SEL   = SS_BLK & SS_ADDR[9:0] == 10'h202;
+	bit  [4:0] SS_RSEL;
+	always @(posedge CLK) SS_RSEL <= {SS_RUN_SEL, SS_MSH_SEL, SS_SSH_SEL, SS_IF_SEL | SS_MDROM_SEL, SS_VDP_SEL | SS_PAL_SEL};
+	bit  [31:0] MSH_SS_Q, SSH_SS_Q, IF_SS_Q, VDP_SS_Q;
+	assign SS_RD_DATA = ({32{SS_RSEL[3]}} & MSH_SS_Q) | ({32{SS_RSEL[2]}} & SSH_SS_Q) |
+	                    ({32{SS_RSEL[1]}} & IF_SS_Q)  | ({32{SS_RSEL[0]}} & VDP_SS_Q) |
+	                    ({32{SS_RSEL[4]}} & {16'd0, SS_RUN});
 
 	bit  [26:0] SHA;
 	bit  [31:0] SHDO;
@@ -193,7 +278,15 @@ module S32X
 		
 		.MD(6'b001000),
 		
-		.FAST(0)
+		.FAST(0),
+		
+		.SS_HOLD(SS_PARK),
+		.SS_BUS_IDLE(MSH_SS_BUS_IDLE),
+		.SS_SEL(SS_MSH_SEL),
+		.SS_ADDR(SS_ADDR[11:0]),
+		.SS_WR_EN(SS_WR_EN & SS_MSH_SEL),
+		.SS_WR_DATA(SS_WR_DATA),
+		.SS_RD_DATA(MSH_SS_Q)
 	);
 	
 	SH7604 #(.BUS_AREA_TIMIMG(4'b1000), .BUS_SIZE_BYTE_DISABLE(1)) SSH
@@ -249,7 +342,15 @@ module S32X
 		
 		.MD(6'b101000),
 		
-		.FAST(0)
+		.FAST(0),
+		
+		.SS_HOLD(SS_PARK),
+		.SS_BUS_IDLE(SSH_SS_BUS_IDLE),
+		.SS_SEL(SS_SSH_SEL),
+		.SS_ADDR(SS_ADDR[11:0] & 12'(SS_SH_SLOT-1)),
+		.SS_WR_EN(SS_WR_EN & SS_SSH_SEL),
+		.SS_WR_DATA(SS_WR_DATA),
+		.SS_RD_DATA(SSH_SS_Q)
 	);
 	
 	
@@ -345,7 +446,20 @@ module S32X
 		.PWM_L(PWM_L),
 		.PWM_R(PWM_R),
 		
-		.ROM_WAIT(ROM_WAIT)
+		.ROM_WAIT(ROM_WAIT),
+
+		.ADEN(ADEN),
+		
+		.SS_PHASE_HOLD(SS_PHASE_HOLD),
+		.SS_ACTIVE(SS_ACTIVE),
+		.SS_SEL(SS_IF_SEL),
+		.SS_MDROM_SEL(SS_MDROM_SEL),
+		.SS_ADDR(SS_ADDR[4:0]),
+		.SS_WR_EN(SS_WR_EN),
+		.SS_WR_DATA(SS_WR_DATA),
+		.SS_RD_DATA(IF_SS_Q),
+		.SS_SH_IDLE(IF_SS_SH_IDLE),
+		.SS_QUIET(IF_SS_QUIET)
 	);
 	
 	assign CA = IF_SEL ? {2'b00,SHA[21:1]} : {VA[23:22],IF_OVA,VA[18:1]};
@@ -408,8 +522,20 @@ module S32X
 		.HS_N(HS_N),
 		.VS_N(VS_N),
 		.YSO_N(YSO_N),
-		.HBL(HBL)
+		.HBL(HBL),
+		
+		.SS_PHASE_HOLD(SS_PHASE_HOLD),
+		.SS_ACTIVE(SS_ACTIVE),
+		.SS_SEL(SS_VDP_SEL),
+		.SS_PAL_SEL(SS_PAL_SEL),
+		.SS_ADDR(SS_ADDR[7:0]),
+		.SS_WR_EN(SS_WR_EN),
+		.SS_WR_DATA(SS_WR_DATA),
+		.SS_RD_DATA(VDP_SS_Q),
+		.SS_QUIET(VDP_SS_QUIET)
 	);
+	
+	assign SS_QUIET = IF_SS_QUIET & VDP_SS_QUIET;
 	
 	assign DBG_CA = {CA,1'b0};
 	

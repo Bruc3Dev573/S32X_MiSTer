@@ -50,7 +50,11 @@ module SH7604_INTC (
 	input             SCI_TEI_IRQ,
 	input             FRT_ICI_IRQ,
 	input             FRT_OCI_IRQ,
-	input             FRT_OVI_IRQ
+	input             FRT_OVI_IRQ,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
@@ -84,6 +88,19 @@ module SH7604_INTC (
 	bit [ 3:0] IRL_LVL;
 	bit [ 3:0] INT_ACTIVE;
 	bit [ 3:0] INT_ACCEPTED;
+	bit [ 3:0] IRL_OLD[4];
+	bit [ 3:0] IRL_NORM;
+	
+	// Savestate chain: IRL filter, vector fetch, registers, then SS_SI. The 32X ties NMI_N
+	// and IRL_N[0] high, so NMI_REQ, NMI_N_OLD, ICR.NMIL and bit 0 of IRL_NORM/IRL_LVL are
+	// constant there and not saved; BUS_DO is dead at the park.
+`define SS_INTC_IRL {IRL_OLD[0], IRL_OLD[1], IRL_OLD[2], IRL_OLD[3], IRL_NORM[3:1], IRL_LVL[3:1]}
+`define SS_INTC_VB  {VBREQ, VBA, INT_ACCEPTED, IRL_LVL_SAVE[3:1]}
+`define SS_INTC_REG {ICR.NMIE, ICR.VECMD, IPRA[15:4], IPRB[15:8], VCRWDT.WITV, VCRWDT.BCMV, \
+                     VCRA.SERV, VCRA.SRXV, VCRB.STXV, VCRB.STEV, VCRC.FICV, VCRC.FOCV, VCRD.FOVV}
+	wire [22+31:0] ss_irl;
+	wire [12+31:0] ss_vb;
+	wire [85+31:0] ss_reg;
 	
 	always @(posedge CLK or negedge RST_N) begin
 		bit NMI_N_OLD;
@@ -106,12 +123,12 @@ module SH7604_INTC (
 	end
 	
 	always @(posedge CLK or negedge RST_N) begin
-		bit [3:0] IRL_OLD[4];
-		bit [3:0] IRL_NORM;
-		
 		if (!RST_N) begin
 			IRL_OLD <= '{4{'1}};
 			IRL_NORM <= '0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_INTC_IRL <= ss_irl[21:0];
 		end
 		else if (!RES_N) begin	
 			IRL_OLD <= '{4{'1}};
@@ -203,6 +220,8 @@ module SH7604_INTC (
 			VBREQ <= 0;
 			VBA <= '0;
 			INT_ACCEPTED <= '0;
+		end else if (SS_SHIFT) begin
+			`SS_INTC_VB <= ss_vb[11:0];
 		end else if (EN && CE_F) begin	
 			if (VECT_REQ && !VBREQ) begin
 				VBREQ <= 1;
@@ -236,6 +255,9 @@ module SH7604_INTC (
 			VCRB   <= VCRB_INIT;
 			VCRC   <= VCRC_INIT;
 			VCRD   <= VCRD_INIT;
+		end
+		else if (SS_SHIFT) begin
+			`SS_INTC_REG <= ss_reg[84:0];
 		end
 		else if (CE_R) begin
 			if (!RES_N) begin
@@ -317,5 +339,13 @@ module SH7604_INTC (
 	assign IBUS_DO = BUS_DO;
 	assign IBUS_BUSY = 0;
 	assign IBUS_ACT = REG_SEL;
+	
+	assign ss_irl = {`SS_INTC_IRL, ss_vb[12+31:12]};
+	assign ss_vb  = {`SS_INTC_VB,  ss_reg[85+31:85]};
+	assign ss_reg = {`SS_INTC_REG, SS_SI};
+	assign SS_SO  = ss_irl[22+31:22];
+`undef SS_INTC_IRL
+`undef SS_INTC_VB
+`undef SS_INTC_REG
 
 endmodule

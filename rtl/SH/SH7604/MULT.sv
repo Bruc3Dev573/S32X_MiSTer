@@ -18,7 +18,11 @@ module SH7604_MULT (
 	input       [1:0] MAC_SEL,
 	input       [3:0] MAC_OP,
 	input             MAC_S,
-	input             MAC_WE
+	input             MAC_WE,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
@@ -28,6 +32,13 @@ module SH7604_MULT (
 	bit [31:0] MA;
 	bit [31:0] MB;
 	bit        MM_DONE;
+	bit [ 1:0] MM_CYC;
+	
+	// Savestate chain. MA holds the first operand between the two accesses of MAC and
+	// MUL.L. MB/SAT/SIGNED load with the *_EXEC flags, whose result commits on the clock
+	// after CE_R: dead at the park.
+	wire [99+31:0] ss_q = {MACH, MACL, MA, MM_DONE, MM_CYC, SS_SI};
+	assign SS_SO = ss_q[99+31:99];
 	
 	wire [63:0] SRES =   $signed(MA) *   $signed(MB);
 	wire [63:0] URES = $unsigned(MA) * $unsigned(MB);
@@ -35,7 +46,6 @@ module SH7604_MULT (
 	wire [32:0] ACC32  = $signed({MACL[31],MACL}) + $signed(SRES[32:0]);
 	
 	always @(posedge CLK or negedge RST_N) begin
-		bit [ 1: 0] MM_CYC;
 		bit         MUL_EXEC;
 		bit         DMUL_EXEC;
 		bit         MACW_EXEC;
@@ -60,6 +70,9 @@ module SH7604_MULT (
 			MACL <= 32'h01234567;
 			MACH <= 32'h89ABCDEF;
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			{MACH, MACL, MA, MM_DONE, MM_CYC} <= ss_q[98:0];
 		end
 		else begin
 			if (MAC_SEL && MAC_WE && EN && CE_R) begin

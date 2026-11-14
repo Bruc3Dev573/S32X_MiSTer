@@ -81,11 +81,27 @@ module S32X_IF
 	output reg        MD_CP_READ,
 	output reg        MD_CP_WRITE,
 	output reg        SH_CP_READ,
-	output reg        SH_CP_WRITE
+	output reg        SH_CP_WRITE,
+
+	output            ADEN,
+
+	// Savestate (driven by 32X.sv). SS_SEL: the S32X_PKG::SS_IF_SIZE adapter words,
+	// SS_MDROM_SEL: the 2 writable MD BIOS words; SS_ADDR is the word inside the region.
+	input             SS_PHASE_HOLD,	// freeze the raster-derived HINT/VINT edge logic
+	input             SS_ACTIVE,		// everything parked: the MD BIOS RAM port is taken over
+	input             SS_SEL,
+	input             SS_MDROM_SEL,
+	input       [4:0] SS_ADDR,
+	input             SS_WR_EN,
+	input      [31:0] SS_WR_DATA,
+	output     [31:0] SS_RD_DATA,
+	output            SS_SH_IDLE,		// no SH-side handshake in flight
+	output            SS_QUIET			// no handshake in flight on either side
 );
 	import S32X_PKG::*;
 
 	ADCR_t     ADCR;
+	assign ADEN = ADCR.ADEN;
 	ICR_t      ICR;
 	BSR_t      BSR;
 	DCR_t      DCR;
@@ -185,9 +201,12 @@ module S32X_IF
 	bit [15:0] SHROM_Q;
 	SHROM shrom(.clock(CLK), .address({SHCS0M_N,SHA[10:1]}), .q(SHROM_Q));
 
+	// The MD BIOS RAM port is the savestate's while everything is parked (the 68000 is
+	// off the bus): its only writable words are 70h-73h, image words 0 and 1.
 	wire MDROM_WE = VA[23:2] == 24'h000070>>2 & (LWR_F | UWR_F) & ~AS_N & ADCR.ADEN;
 	bit [15:0] MDROM_Q;
-	MDROM mdrom(.clock(CLK), .address(VA[7:1]), .data(VDI), .wren(MDROM_WE), .q(MDROM_Q));
+	MDROM mdrom(.clock(CLK), .address(SS_ACTIVE ? {6'b011100,SS_ADDR[0]} : VA[7:1]), 
+	            .data(SS_ACTIVE ? SS_WR_DATA[15:0] : VDI), .wren(SS_ACTIVE ? SS_MDROM_SEL & SS_WR_EN : MDROM_WE), .q(MDROM_Q));
 	
 	
 	wire MD_SYSREG_SEL = VA[23:7] == 24'hA15100>>7;		//A15100-A1517F
@@ -199,23 +218,45 @@ module S32X_IF
 	wire SH_BIOS_SEL = (~SHCS0M_N | ~SHCS0S_N) & SHA[17:14] == 4'b0000;	//00000000-00003FFF,20000000-20003FFF
 	wire SH_SYSREG_SEL = (~SHCS0M_N | ~SHCS0S_N) & SHA[17:8] == 10'h040;	//00004000-000040FF,20004000-200040FF										
 	
+	// Savestate image of the adapter, S32X_PKG::SS_IF_SIZE words (layout below). Fields
+	// are right-aligned in their word, unused bits are 0. The rest of the adapter is idle
+	// at the park (SS_SH_IDLE/SS_QUIET) or derived every clock (CYC_CNT_NEXT, TIME_CNT_NEXT).
+	// PWMCR (word 3) comes before TIME_CNT (word 18): the PWM logic clears TIME_CNT on
+	// every clock while PWMCR has both channels off.
+	bit        SH_SYSREG_ACCESS;
+	bit        SH_BIOS_ACCESS;
+	bit        FIFO_REQ_AVAIL;
+	bit        FIFO_REQ_PEND;
+	bit        VDP_HINT_OLD;
+	bit        VDP_VINT_OLD;
+	bit  [1:0] LPWFIFO_AMOUNT,RPWFIFO_AMOUNT;
+	bit        PWM_REQ_PEND;
+	bit        MD_ROM_WAIT;
+	
+	`define IF_SS_W0  {SH_SYSREG_ACCESS,ADCR.FM,ADCR.REN,ADCR.RES,ADCR.ADEN,ICR.INTS,ICR.INTM,BSR.BK,DCR.M68S,DCR.DMA,DCR.RV,STVR.CM,IMMR.HEN,IMMR.V,IMMR.H,IMMR.CMD,IMMR.PWM,IMSR.V,IMSR.H,IMSR.CMD,IMSR.PWM,V_INTM,H_INTM,PWM_INTM,V_INTS,H_INTS,PWM_INTS}
+	`define IF_SS_W1  {DSAR[23:1],MD_DMA_EXEC,FIFO_REQ,FIFO_REQ2,FIFO_REQ3,FIFO_REQ_AVAIL,FIFO_REQ_PEND}
+	`define IF_SS_W2  {DDAR,LINE_CNT}
+	`define IF_SS_W3  {DLR,PWMCR.TM,PWMCR.RTP,PWMCR.MONO,PWMCR.RMD,PWMCR.LMD}
+	`define IF_SS_W12 {LPW_BUF[1],LPW_BUF[0],LPW_BUF_RDPOS,LPW_BUF_WRPOS,RPW_BUF_RDPOS,RPW_BUF_WRPOS}
+	`define IF_SS_W13 {RPW_BUF[0],LPW_BUF[2],LPWFIFO_AMOUNT,RPWFIFO_AMOUNT,PWM_OUT,LPW_SET,RPW_SET}
+	`define IF_SS_W14 {RPW_BUF[2],RPW_BUF[1],PWM_REQ,PWM_REQ_PEND,VDP_HINT_OLD,VDP_VINT_OLD,FIFO_FULL,FIFO_EMPTY}
+	`define IF_SS_W15 {LPW_DATA,RPW_DATA,FIFO_WR_POS,FIFO_RD_POS}
+	`define IF_SS_W16 {LPWR.FULL,LPWR.EMPTY,LPWR.PW,RPWR.FULL,RPWR.EMPTY,RPWR.PW,FIFO_AMOUNT}
+	`define IF_SS_W18 {CYC_CNT,CYCR,TIME_CNT}
+	// Word 0 also holds MD_ROM_WAIT (bit 31), word 17 HCNTR (31:24) and PWM_L/PWM_R (23:0).
+	
+	// The engine holds SS_WR_EN for 2 clocks; every load write is idempotent.
+	wire [SS_IF_SIZE-1:0] ss_we = {SS_IF_SIZE{SS_SEL & SS_WR_EN}} & ({{SS_IF_SIZE-1{1'b0}},1'b1} << SS_ADDR);
+	
 	always @(posedge CLK or negedge RST_N) begin
-		bit        SH_SYSREG_ACCESS;
-		bit        SH_BIOS_ACCESS;
 		bit        MD_DMA_READ_OLD;
 		bit [15:0] DLR_NEXT;
 		bit        FIFO_INC_AMOUNT;
 		bit        FIFO_DEC_AMOUNT;
-		bit        FIFO_REQ_AVAIL;
-		bit        FIFO_REQ_PEND;
-		bit        VDP_HINT_OLD;
-		bit        VDP_VINT_OLD;
 		bit [15:0] CYC_CNT_NEXT;
 		bit  [4:0] TIME_CNT_NEXT;
 		bit        LPWFIFO_INC_AMOUNT,LPWFIFO_DEC_AMOUNT;
 		bit        RPWFIFO_INC_AMOUNT,RPWFIFO_DEC_AMOUNT;
-		bit  [1:0] LPWFIFO_AMOUNT,RPWFIFO_AMOUNT;
-		bit        PWM_REQ_PEND;
 		
 		if (!RST_N) begin
 			ADCR <= ADCR_INIT;
@@ -632,20 +673,24 @@ module S32X_IF
 			end
 			
 			//HINT,VINT
-			VDP_HINT_OLD <= VDP_HINT;
-			if (VDP_HINT && !VDP_HINT_OLD) begin
-				LINE_CNT <= LINE_CNT + 8'd1;
-				if (LINE_CNT == HCNTR) begin
-					LINE_CNT <= '0;
-					if (IMMR.H && (IMMR.HEN || !VDP_VINT)) H_INTM <= 1;
-					if (IMSR.H && (IMMR.HEN || !VDP_VINT)) H_INTS <= 1;
+			// Held with the raster phase during a savestate: the release comes back at the
+			// park's raster phase, so no edge is lost or seen twice.
+			if (!SS_PHASE_HOLD) begin
+				VDP_HINT_OLD <= VDP_HINT;
+				if (VDP_HINT && !VDP_HINT_OLD) begin
+					LINE_CNT <= LINE_CNT + 8'd1;
+					if (LINE_CNT == HCNTR) begin
+						LINE_CNT <= '0;
+						if (IMMR.H && (IMMR.HEN || !VDP_VINT)) H_INTM <= 1;
+						if (IMSR.H && (IMMR.HEN || !VDP_VINT)) H_INTS <= 1;
+					end
 				end
-			end
-			
-			VDP_VINT_OLD <= VDP_VINT;
-			if (VDP_VINT && !VDP_VINT_OLD) begin
-				if (IMMR.V) V_INTM <= 1;
-				if (IMSR.V) V_INTS <= 1;
+				
+				VDP_VINT_OLD <= VDP_VINT;
+				if (VDP_VINT && !VDP_VINT_OLD) begin
+					if (IMMR.V) V_INTM <= 1;
+					if (IMSR.V) V_INTS <= 1;
+				end
 			end
 			
 			//DREQ
@@ -742,6 +787,27 @@ module S32X_IF
 					PWM_REQ <= 0;
 				end
 			end
+			
+			// Savestate load, after everything above so the image wins.
+			if (ss_we[0])  `IF_SS_W0  <= SS_WR_DATA[27:0];
+			if (ss_we[1])  `IF_SS_W1  <= SS_WR_DATA[28:0];
+			if (ss_we[2])  `IF_SS_W2  <= SS_WR_DATA;
+			if (ss_we[3])  `IF_SS_W3  <= SS_WR_DATA[25:0];
+			if (ss_we[4])  {CP1R,CP0R} <= SS_WR_DATA;
+			if (ss_we[5])  {CP3R,CP2R} <= SS_WR_DATA;
+			if (ss_we[6])  {CP5R,CP4R} <= SS_WR_DATA;
+			if (ss_we[7])  {CP7R,CP6R} <= SS_WR_DATA;
+			if (ss_we[8])  {FIFO_BUF[1],FIFO_BUF[0]} <= SS_WR_DATA;
+			if (ss_we[9])  {FIFO_BUF[3],FIFO_BUF[2]} <= SS_WR_DATA;
+			if (ss_we[10]) {FIFO_BUF[5],FIFO_BUF[4]} <= SS_WR_DATA;
+			if (ss_we[11]) {FIFO_BUF[7],FIFO_BUF[6]} <= SS_WR_DATA;
+			if (ss_we[12]) `IF_SS_W12 <= SS_WR_DATA;
+			if (ss_we[13]) `IF_SS_W13 <= SS_WR_DATA;
+			if (ss_we[14]) `IF_SS_W14 <= SS_WR_DATA[29:0];
+			if (ss_we[15]) `IF_SS_W15 <= SS_WR_DATA[29:0];
+			if (ss_we[16]) `IF_SS_W16 <= SS_WR_DATA;
+			if (ss_we[17]) HCNTR <= SS_WR_DATA[31:24];
+			if (ss_we[18]) `IF_SS_W18 <= SS_WR_DATA;
 		end
 	end
 //	assign PWM_L = {LPW_BUF[LPW_BUF_RDPOS] - 12'h800,4'h0};
@@ -752,6 +818,9 @@ module S32X_IF
 		
 		if (!RST_N) begin
 			
+		end
+		else if (ss_we[17]) begin
+			{PWM_L[15:4],PWM_R[15:4]} <= SS_WR_DATA[23:0];	// bits 3:0 are always 0
 		end
 		else if (CE_R) begin
 			if (!LPW_DATA) TMPL = '0;
@@ -794,7 +863,6 @@ module S32X_IF
 	bit        S32X_CAS0;
 	always @(posedge CLK or negedge RST_N) begin
 		
-		bit        MD_ROM_WAIT;
 		bit        SH_ROM_READ;
 		
 		if (!RST_N) begin
@@ -909,6 +977,8 @@ module S32X_IF
 					ROM_WAIT_CNT <= ROM_WAIT_CNT + 8'd1;
 				end
 			endcase
+			
+			if (ss_we[0]) MD_ROM_WAIT <= SS_WR_DATA[31];
 		end
 	end
 	
@@ -924,9 +994,9 @@ module S32X_IF
 	wire SH_VDPDRAM_SEL = ~SHCS2_N;														//04000000-0403FFFF,24000000-2403FFFF	
 	wire SH_VDP_SEL = SH_VDPREG_SEL | SH_VDPPAL_SEL | SH_VDPDRAM_SEL;
 	
+	bit        MD_VDP_ACCESS;
+	bit        SH_VDP_ACCESS;
 	always @(posedge CLK or negedge RST_N) begin
-		bit        MD_VDP_ACCESS;
-		bit        SH_VDP_ACCESS;
 		
 		if (!RST_N) begin
 			VDP_RD_N <= 1;
@@ -1063,5 +1133,51 @@ module S32X_IF
 	assign SEL = SH_ROM_GRANT;
 
 	assign DBG_VA = {VA,1'b0};
+	
+	// Savestate read: registered, valid 1 clock after SS_ADDR changes. The MD BIOS RAM
+	// word is valid 1 clock after SS_ADDR changes too (address register of the RAM).
+	bit [31:0] SS_IF_Q;
+	always @(posedge CLK) begin
+		case (SS_ADDR)
+			5'd0:  SS_IF_Q <= {MD_ROM_WAIT,3'b000,`IF_SS_W0};
+			5'd1:  SS_IF_Q <= 32'(`IF_SS_W1);
+			5'd2:  SS_IF_Q <= `IF_SS_W2;
+			5'd3:  SS_IF_Q <= 32'(`IF_SS_W3);
+			5'd4:  SS_IF_Q <= {CP1R,CP0R};
+			5'd5:  SS_IF_Q <= {CP3R,CP2R};
+			5'd6:  SS_IF_Q <= {CP5R,CP4R};
+			5'd7:  SS_IF_Q <= {CP7R,CP6R};
+			5'd8:  SS_IF_Q <= {FIFO_BUF[1],FIFO_BUF[0]};
+			5'd9:  SS_IF_Q <= {FIFO_BUF[3],FIFO_BUF[2]};
+			5'd10: SS_IF_Q <= {FIFO_BUF[5],FIFO_BUF[4]};
+			5'd11: SS_IF_Q <= {FIFO_BUF[7],FIFO_BUF[6]};
+			5'd12: SS_IF_Q <= `IF_SS_W12;
+			5'd13: SS_IF_Q <= `IF_SS_W13;
+			5'd14: SS_IF_Q <= 32'(`IF_SS_W14);
+			5'd15: SS_IF_Q <= 32'(`IF_SS_W15);
+			5'd16: SS_IF_Q <= `IF_SS_W16;
+			5'd17: SS_IF_Q <= {HCNTR,PWM_L[15:4],PWM_R[15:4]};
+			5'd18: SS_IF_Q <= `IF_SS_W18;
+			default: SS_IF_Q <= '0;
+		endcase
+	end
+	assign SS_RD_DATA = SS_MDROM_SEL ? {16'h0000,MDROM_Q} : SS_IF_Q;
+	
+	// The SH-side handshakes are idle (checked at the VCLK that parks the SH-2s, whose bus
+	// controllers are then at T0 too). The 68000-side ones finish on their own once the
+	// 68000 is parked with AS_N high; SS_QUIET covers both.
+	assign SS_SH_IDLE = ROM_ST == RS_IDLE & ~SH_ROM_WAIT & ~SH_VDP_WAIT & ~SH_VDP_ACCESS & ~SH_BIOS_ACCESS;
+	assign SS_QUIET   = SS_SH_IDLE & MD_REG_DTACK_N & MD_ROM_DTACK_N & VDP_DTACK_N & ~MD_VDP_ACCESS;
+	
+	`undef IF_SS_W0
+	`undef IF_SS_W1
+	`undef IF_SS_W2
+	`undef IF_SS_W3
+	`undef IF_SS_W12
+	`undef IF_SS_W13
+	`undef IF_SS_W14
+	`undef IF_SS_W15
+	`undef IF_SS_W16
+	`undef IF_SS_W18
 	
 endmodule

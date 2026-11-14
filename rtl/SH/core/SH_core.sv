@@ -34,7 +34,17 @@ module SH_core
 	output            VECT_REQ,
 	input             VECT_WAIT,
 	
-	output            SLEEP
+	output            SLEEP,
+	
+	// Savestate (see SH7604.sv): flop chain and register file access while parked
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO,
+	input             SS_REG_SEL,
+	input       [4:0] SS_REG_N,
+	input             SS_REG_WE,
+	input      [31:0] SS_REG_D,
+	output     [31:0] SS_REG_Q
 `ifdef DEBUG
 	                  ,
 	output     [31:0] DBG_BUS_A,
@@ -96,15 +106,45 @@ module SH_core
 	bit [31: 0] REGS_WBD;
 	bit         REGS_WBE;
 	
+	// The savestate reads R0-R15/PR through port A while the CPU is parked.
 `ifdef DEBUG
-	assign REGS_RAN = EN ? ID_DECI.RA.N : DBG_REGN;
-`elsif
-	assign REGS_RAN = ID_DECI.RA.N;
+	assign REGS_RAN = EN ? (SS_REG_SEL ? SS_REG_N : ID_DECI.RA.N) : DBG_REGN;
+`else
+	assign REGS_RAN = SS_REG_SEL ? SS_REG_N : ID_DECI.RA.N;
 `endif
 	assign REGS_RBN = ID_DECI.RB.N;
+	assign SS_REG_Q = REGS_RAQ;
 	
 	SH2_regfile regfile (CLK, RST_N, CE, EN, REGS_WAN, REGS_WAD, REGS_WAE, REGS_WBN, REGS_WBD, REGS_WBE, 
-								REGS_RAN, REGS_RAQ, REGS_RBN, REGS_RBQ, REGS_R0Q);
+								REGS_RAN, REGS_RAQ, REGS_RBN, REGS_RBQ, REGS_R0Q, SS_REG_WE, SS_REG_N, SS_REG_D);
+	
+	//**********************************************************
+	// Savestate flop chain
+	//**********************************************************
+	// Every flop the next instruction can observe, in 32-bit steps: on SS_SHIFT each
+	// segment takes the low bits of {segment, input} and passes its top 32 bits on.
+	// Copies synthesis prunes (MA/WB/WB2 IR and PC, unread decode fields) are left out.
+	// Order: PC, stage flags, IF, EX, MA, SR/GBR/VBR, WB, WB2, then SS_SI.
+`define SS_CORE_PC  {NPC}
+`define SS_CORE_ACT {MA_ACTIVE, IF_ACTIVE, VECT_ACTIVE, INST_SPLIT, MAWB_STALL}
+`define SS_CORE_IF  {PIPE.ID.IR, PIPE.ID.PC, SAVE_IR, INT_REQ_LATCH, INT_LVL_LATCH, SAVE_ID.IR, SAVE_ID.PC}
+`define SS_CORE_EX  {PIPE.EX.IR, PIPE.EX.DI[74:10], PIPE.EX.DI[7], PIPE.EX.DI[1:0], PIPE.EX.PC, \
+                     PIPE.EX.RA, PIPE.EX.RB, PIPE.EX.R0, PIPE.EX.BC, STATE, IFID_STALL, SLP}
+`define SS_CORE_MA  {PIPE.MA.DI[47:39], PIPE.MA.DI[37:32], PIPE.MA.DI[30], PIPE.MA.DI[21:14], PIPE.MA.DI[7], PIPE.MA.DI[1], \
+                     PIPE.MA.BC, PIPE.MA.RES, PIPE.MA.ADDR, PIPE.MA.WD}
+`define SS_CORE_SR  {SR[9:4], SR[1:0], GBR, VBR}
+`define SS_CORE_WB  {PIPE.WB.DI[45:39], PIPE.WB.DI[37:32], PIPE.WB.DI[30], PIPE.WB.DI[19:18], PIPE.WB.RES, PIPE.WB.RD, RD_SAVE}
+`define SS_CORE_WB2 {PIPE.WB2.DI[43:39], PIPE.WB2.DI[37:32], PIPE.WB2.DI[30], PIPE.WB2.RESA, PIPE.WB2.RESB}
+	bit [15: 0] SAVE_IR;
+	IFtoID_t    SAVE_ID;
+	wire [ 32+31:0] ss_pc;
+	wire [  5+31:0] ss_act;
+	wire [117+31:0] ss_if;
+	wire [218+31:0] ss_ex;
+	wire [123+31:0] ss_ma;
+	wire [ 72+31:0] ss_sr;
+	wire [112+31:0] ss_wb;
+	wire [ 76+31:0] ss_wb2;
 
 	
 	//**********************************************************
@@ -115,6 +155,9 @@ module SH_core
 	always @(posedge CLK or negedge RST_N) begin
 		if (!RST_N) begin
 			NPC <= '0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_PC <= ss_pc[31:0];
 		end
 		else if (!RES_N) begin
 			NPC <= '0;
@@ -145,6 +188,9 @@ module SH_core
 			// synopsys translate_off
 			LOAD_SPLIT <= 0;
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_ACT <= ss_act[4:0];
 		end
 		else if (!RES_N) begin
 			MA_ACTIVE <= 0;
@@ -202,9 +248,7 @@ module SH_core
 	//**********************************************************
 	assign IF_STALL = BUS_STALL | INST_SPLIT | IFID_STALL;
 	
-	IFtoID_t   SAVE_ID;
 	always @(posedge CLK or negedge RST_N) begin
-		bit [15: 0] SAVE_IR;
 		bit [15: 0] NEW_IR;
 		
 		if (!RST_N) begin
@@ -213,6 +257,9 @@ module SH_core
 			SAVE_IR <= '0;
 			INT_REQ_LATCH <= 0;
 			INT_LVL_LATCH <= '0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_IF <= ss_if[116:0];
 		end
 		else if (!RES_N) begin
 			PIPE.ID.IR <= {8'hF0,6'b000000,NMI_N,1'b0};
@@ -306,6 +353,9 @@ module SH_core
 			IFID_STALL <= 0;
 			SLP <= 1;
 		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_EX <= ss_ex[217:0];
+		end
 		else if (!RES_N) begin
 			PIPE.EX.IR <= '0;
 			PIPE.EX.PC <= '0;
@@ -386,9 +436,9 @@ module SH_core
 			SIMM8:  temp = {{24{ir_imm[ 7]}},ir_imm[ 7:0]};
 			ZIMM8:  temp = {{24{1'b0}},      ir_imm[ 7:0]};
 			SIMM12: temp = {{20{ir_imm[11]}},ir_imm[11:0]};
-			ZERO:   temp = 32'h00000000;
 			ONE:    temp = 32'h00000001;
 			VECT:   temp = {{24{1'b0}},      vec};
+			default:temp = 32'h00000000;	//ZERO
 		endcase
 		
 		if (PIPE.EX.DI.BR.BI) begin
@@ -404,7 +454,7 @@ module SH_core
 		case (PIPE.EX.DI.CTRL.S)
 			SR_:  SCR_VAL = SR & 32'h000003F3;
 			GBR_: SCR_VAL = GBR;
-			VBR_: SCR_VAL = VBR;
+			default: SCR_VAL = VBR;	//VBR_
 		endcase
 		
 		if (BP_A_EXEX) begin
@@ -570,7 +620,7 @@ module SH_core
 		case (PIPE.EX.DI.MEM.ADDS)
 			ALUA:    MA_ADDR = REG_A;
 			ALUB:    MA_ADDR = REG_B;
-			ALURES:  MA_ADDR = ALU_RES;
+			default: MA_ADDR = ALU_RES;	//ALURES
 		endcase
 	end
 	
@@ -579,7 +629,7 @@ module SH_core
 		case (PIPE.EX.DI.MEM.WDS)
 			ALUA: MA_WD = REG_A;
 			ALUB: MA_WD = REG_B;
-			ALURES: MA_WD = ALU_RES;
+			default: MA_WD = ALU_RES;	//ALURES
 		endcase
 	end
 	
@@ -592,6 +642,9 @@ module SH_core
 			PIPE.MA.RES <= '0;
 			PIPE.MA.ADDR <= '0;
 			PIPE.MA.WD <= '0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_MA <= ss_ma[122:0];
 		end
 		else if (!RES_N) begin
 			PIPE.MA.IR <= '0;
@@ -650,6 +703,9 @@ module SH_core
 			GBR <= '0;
 			VBR <= '0;
 		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_SR <= ss_sr[71:0];
+		end
 		else if (!RES_N) begin
 			SR <= SR_RESET;
 			GBR <= '0;
@@ -700,6 +756,9 @@ module SH_core
 			PIPE.WB.DI <= DECI_RESET;
 			PIPE.WB.RES <= '0;
 			PIPE.WB.RD <= '0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_WB <= ss_wb[111:0];
 		end
 		else if (!RES_N) begin
 			PIPE.WB.IR <= '0;
@@ -760,6 +819,9 @@ module SH_core
 			PIPE.WB2.RESA <= '0;
 			PIPE.WB2.RESB <= '0;
 		end
+		else if (SS_SHIFT) begin
+			`SS_CORE_WB2 <= ss_wb2[75:0];
+		end
 		else if (!RES_N) begin
 			PIPE.WB2.IR <= '0;
 			PIPE.WB2.DI <= DECI_RESET;
@@ -789,6 +851,24 @@ module SH_core
 	assign REGS_WBN = PIPE.WB.DI.RB.N;
 	assign REGS_WBD = PIPE.WB.RES;
 	assign REGS_WBE = PIPE.WB.DI.RB.W & (!PIPE.WB.DI.RA.W | PIPE.WB.DI.RA.N != PIPE.WB.DI.RB.N) & !WB_STALL;
+	
+	assign ss_pc  = {`SS_CORE_PC,  ss_act[5+31:5]};
+	assign ss_act = {`SS_CORE_ACT, ss_if[117+31:117]};
+	assign ss_if  = {`SS_CORE_IF,  ss_ex[218+31:218]};
+	assign ss_ex  = {`SS_CORE_EX,  ss_ma[123+31:123]};
+	assign ss_ma  = {`SS_CORE_MA,  ss_sr[72+31:72]};
+	assign ss_sr  = {`SS_CORE_SR,  ss_wb[112+31:112]};
+	assign ss_wb  = {`SS_CORE_WB,  ss_wb2[76+31:76]};
+	assign ss_wb2 = {`SS_CORE_WB2, SS_SI};
+	assign SS_SO  = ss_pc[32+31:32];
+`undef SS_CORE_PC
+`undef SS_CORE_ACT
+`undef SS_CORE_IF
+`undef SS_CORE_EX
+`undef SS_CORE_MA
+`undef SS_CORE_SR
+`undef SS_CORE_WB
+`undef SS_CORE_WB2
 	
 	//Ports
 	assign BUS_A = MA_ACTIVE ? PIPE.MA.ADDR : (PC & 32'hFFFFFFFC);

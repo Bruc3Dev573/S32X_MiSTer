@@ -35,7 +35,11 @@ module SH7604_WDT
 	output            ITI_IRQ,
 	output reg        OVF,
 	output            PRES,
-	output            MRES
+	output            MRES,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
@@ -44,6 +48,20 @@ module SH7604_WDT
 	WTCSR_t     WTCSR;
 	RSTCSR_t    RSTCSR;
 	bit         WRES;
+	bit          TM_EN;
+	bit          OVF_SET;
+	bit  [ 7: 0] OPEN_BUS;
+	bit          IBUS_REQ_OLD;
+	bit  [ 1: 0] BUSY;
+	
+	// Savestate chain: counter and registers, bus handshake, then SS_SI. The 32X ties
+	// NMI_N high and leaves WDTOVF_N unconnected, so SBY_TME, NMI_OLD, OVF, WDTOVF_N and
+	// WRES are constant or unused there and not saved; REG_DO is dead at the park.
+`define SS_WDT_REG {WTCNT, WTCSR.OVF, WTCSR.WTIT, WTCSR.TME, WTCSR.CKS, RSTCSR.WOVF, RSTCSR.RSTE, RSTCSR.RSTS, \
+                    TM_EN, OVF_SET, OPEN_BUS}
+`define SS_WDT_BUS {IBUS_REQ_OLD, BUSY}
+	wire [27+31:0] ss_reg;
+	wire [ 3+31:0] ss_bus;
 	
 	//Clock selector
 	bit         WT_CE;
@@ -115,11 +133,7 @@ module SH7604_WDT
 	
 	//Registers
 	wire REG_SEL = (IBUS_A >= 32'hFFFFFE80 && IBUS_A <= 32'hFFFFFE8F);
-	bit  [ 7: 0] OPEN_BUS;
-	bit          IBUS_REQ_OLD;
 	always @(posedge CLK or negedge RST_N) begin
-		bit          TM_EN;
-		bit          OVF_SET;
 		
 		if (!RST_N) begin
 			// synopsys translate_off
@@ -130,6 +144,9 @@ module SH7604_WDT
 			OVF <= 0;
 			TM_EN <= 0;
 			OVF_SET <= 0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_WDT_REG <= ss_reg[26:0];
 		end
 		else begin
 			if (!RES_N) begin
@@ -205,11 +222,13 @@ module SH7604_WDT
 	assign ITI_IRQ = WTCSR.OVF;
 	
 	bit  [ 7: 0] REG_DO;
-	bit  [ 1: 0] BUSY;
 	always @(posedge CLK or negedge RST_N) begin
 		if (!RST_N) begin
 			REG_DO <= '0;
 			BUSY <= '0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_WDT_BUS <= ss_bus[2:0];
 		end
 		else begin
 			if (!RES_N) begin
@@ -244,5 +263,11 @@ module SH7604_WDT
 	assign IBUS_DO = REG_SEL ? {4{REG_DO}} : '0;
 	assign IBUS_BUSY = |BUSY;
 	assign IBUS_ACT = REG_SEL;
+	
+	assign ss_reg = {`SS_WDT_REG, ss_bus[3+31:3]};
+	assign ss_bus = {`SS_WDT_BUS, SS_SI};
+	assign SS_SO  = ss_reg[27+31:27];
+`undef SS_WDT_REG
+`undef SS_WDT_BUS
 	
 endmodule

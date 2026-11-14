@@ -17,7 +17,12 @@ module SH7604_DIVU (
 	output            IBUS_ACT,
 	
 	output            IRQ,
-	output      [7:0] VEC
+	output      [7:0] VEC,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO,
+	output            SS_IDLE
 );
 
 	import SH7604_PKG::*;
@@ -47,6 +52,16 @@ module SH7604_DIVU (
 	bit          OVF;
 	wire [64: 0] SUM = $signed(R) - $signed(D);
 	wire [64: 0] SUM64 = T64 ? $signed({R64[63],R64}) - $unsigned(D64) : $signed({R64[63],R64}) + $unsigned(D64);
+	bit          SND_UPD;
+	
+	// Savestate chain. The savestate parks only between divisions (SS_IDLE), so the
+	// datapath (R, D, Q, R64, D64, VAL, NEG and the sign/overflow temporaries) is not saved.
+	wire [  1+31:0] ss_bsy = {BUSY, SS_SI};
+	wire [179+31:0] ss_reg = {DVSR, DVDNTL, DVDNTH, DVCR[1:0], VCRDIV, DVDNTL2, DVDNTH2, SND_UPD, ss_bsy[1+31:1]};
+	wire [  6+31:0] ss_op  = {STEP, ss_reg[179+31:179]};
+	assign SS_SO = ss_op[6+31:6];
+	assign SS_IDLE = (STEP == 6'h3F);
+	
 	always @(posedge CLK or negedge RST_N) begin
 		bit  [64: 0] VAL;
 		bit          NEG;
@@ -56,6 +71,9 @@ module SH7604_DIVU (
 		if (!RST_N) begin
 			STEP <= 6'h3F;
 			OVF <= 0;
+		end
+		else if (SS_SHIFT) begin
+			STEP <= ss_op[5:0];
 		end
 		else if (EN && CE_F) begin
 			if (STEP == 6'd1) begin
@@ -143,8 +161,6 @@ module SH7604_DIVU (
 	
 	//Registers
 	always @(posedge CLK or negedge RST_N) begin
-		bit          SND_UPD;
-		
 		if (!RST_N) begin
 			DVSR <= DVSR_INIT;
 			DVDNTL <= DVDNT_INIT;
@@ -156,6 +172,9 @@ module SH7604_DIVU (
 			// synopsys translate_off
 			
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			{DVSR, DVDNTL, DVDNTH, DVCR[1:0], VCRDIV, DVDNTL2, DVDNTH2, SND_UPD} <= ss_reg[178:0];
 		end
 		else if (CE_R) begin
 			if (!RES_N) begin
@@ -245,6 +264,9 @@ module SH7604_DIVU (
 	always @(posedge CLK or negedge RST_N) begin
 		if (!RST_N) begin
 			BUSY <= 0;
+		end
+		else if (SS_SHIFT) begin
+			BUSY <= ss_bsy[0];
 		end
 		else if (EN && CE_F) begin
 			if (REG_SEL && IBUS_REQ && OPERATE && !BUSY) begin

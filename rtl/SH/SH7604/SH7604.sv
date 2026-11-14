@@ -66,7 +66,18 @@ module SH7604
 	
 	input       [5:0] MD,
 	
-	input             FAST
+	input             FAST,
+	
+	// Savestate. SS_HOLD: this CPU is parked (VCLK blocked, no CE_R/CE_F); the access ports
+	// below are ignored while it is low. SS_BUS_IDLE: safe to park at the coming VCLK (bus
+	// controller at T0, divider idle). Image layout: see the savestate section below.
+	input             SS_HOLD,
+	output            SS_BUS_IDLE,
+	input             SS_SEL,
+	input      [11:0] SS_ADDR,
+	input             SS_WR_EN,
+	input      [31:0] SS_WR_DATA,
+	output     [31:0] SS_RD_DATA
 	
 `ifdef DEBUG
 	                  ,
@@ -78,6 +89,81 @@ module SH7604
 );
 
 	import SH7604_PKG::*;
+	
+	//**********************************************************
+	// Savestate
+	//**********************************************************
+	// Image (32-bit words at SS_ADDR, SS_IMAGE_SIZE = 'h600), written only while parked:
+	//   000-048  flop chain, 2319 bits, MSB of word 000 first: reset sync and clock divider
+	//            (27 bits), 17 pad bits, then core, MULT, DIVU, DMAC, INTC, FRT, WDT, SCI,
+	//            UBC, MSBY, BSC, cache (the order of the SS_SI/SS_SO links below)
+	//   049-0DF  reserved (read 0)
+	//   0E0-0EF  R0-R15, 0F0 PR, 0F1-0FF reserved
+	//   100-1FF  cache address array, 100 + index*4 + way: [19:1] tag, [0] valid,
+	//            [20] line purge pending, [26:21] LRU of the index, [27] LRU purge pending
+	//   200-5FF  cache data array, 200 + way*256 + longword (the 0xC0000000 offset / 4)
+	// The chain shifts one word when SS_ADDR leaves a chain word during a save (after the
+	// last word it is back in its original state) and on the first clock of SS_WR_EN
+	// during a load. SS_RD_DATA is valid 1 clock after SS_ADDR changes.
+	// Flops that are dead or constant at the park are left out: bus read latches (REG_DO)
+	// consumed by the CE_R after they load, MULT operands and the DIVU datapath, the
+	// regfile write-B latch, one-clock pulses, and what the 32X ties off or leaves
+	// unconnected (see each module).
+	// chain bits: top 27, core 755, MULT 99, DIVU 186, DMAC 374, INTC 119, FRT 78, WDT 30,
+	// SCI 100, UBC 217, MSBY 3, BSC 209 (+9 with byte areas), cache 122
+	localparam SS_BITS  = 27 + 755 + 99 + 186 + 374 + 119 + 78 + 30 + 100 + 217 + 3 +
+	                      209 + (BUS_SIZE_BYTE_DISABLE ? 0 : 9) + 122;
+	localparam SS_WORDS = (SS_BITS + 32) / 32;
+	localparam SS_PAD   = SS_WORDS*32 - SS_BITS;
+	
+	wire        ss_on   = SS_SEL & SS_HOLD;
+	wire        ss_chain = ss_on & (SS_ADDR < SS_WORDS);
+	wire        ss_regs  = ss_on & (SS_ADDR[11:5] == 7'h07) & (~SS_ADDR[4] | ~|SS_ADDR[3:0]);
+	wire        ss_tag   = ss_on & (SS_ADDR[11:8] == 4'h1);
+	wire        ss_data  = ss_on & ((SS_ADDR[11:9] == 3'd1) | (SS_ADDR[11:9] == 3'd2));
+	wire  [9:0] ss_cache_a = {SS_ADDR[9] ^ ss_data, SS_ADDR[8:0]};
+	
+	bit         ss_chain_d, ss_a0_d, ss_wrote;
+	bit   [6:0] ss_cnt;
+	wire        ss_chg   = ~ss_chain_d | (SS_ADDR[0] ^ ss_a0_d);
+	wire        ss_leave = ss_chain_d & (~ss_chain | ss_chg);
+	wire        ss_done  = ss_wrote & ~ss_chg;
+	wire        ss_load  = ss_chain & SS_WR_EN & ~ss_done;
+	wire        SS_SHIFT = ss_load | (ss_leave & ~ss_wrote);
+	// The chain holds a mix of words between the first and the last shift. Only then must
+	// the logic that is not CE-gated (resets, cache purge) and the pins ignore it.
+	wire        ss_rot   = |ss_cnt;
+	always @(posedge CLK or negedge RST_N) begin
+		if (!RST_N) begin
+			ss_chain_d <= 0;
+			ss_a0_d <= 0;
+			ss_wrote <= 0;
+			ss_cnt <= '0;
+		end
+		else begin
+			ss_chain_d <= ss_chain;
+			ss_a0_d <= SS_ADDR[0];
+			ss_wrote <= ss_chain & (ss_load | ss_done);
+			if (SS_SHIFT) ss_cnt <= ss_cnt == SS_WORDS-1 ? 7'd0 : ss_cnt + 7'd1;
+		end
+	end
+	
+	wire [31:0] ss_chain_in;
+	wire [31:0] ss_core_so, ss_mult_so, ss_divu_so, ss_dmac_so, ss_intc_so, ss_frt_so, ss_wdt_so;
+	wire [31:0] ss_sci_so, ss_ubc_so, ss_msby_so, ss_bsc_so, ss_cache_so;
+	wire [31:0] ss_regs_q, ss_cache_q;
+	wire        ss_bsc_idle, ss_divu_idle;
+	wire [       1+31:0] ss_res;
+	wire [      26+31:0] ss_div;
+	wire [SS_PAD+31:0] ss_padc;
+	bit  [SS_PAD-1:0] ss_pad;
+	always @(posedge CLK) if (SS_SHIFT) ss_pad <= ss_padc[SS_PAD-1:0];
+	
+	assign SS_BUS_IDLE = ss_bsc_idle & ss_divu_idle;
+	assign SS_RD_DATA  = ss_chain ? ss_res[1+31:1] :
+	                     ss_regs  ? ss_regs_q :
+	                     ss_tag | ss_data ? ss_cache_q : '0;
+	assign ss_chain_in = ss_load ? SS_WR_DATA : ss_res[1+31:1];
 	
 	bit [31:0] CBUS_A;
 	bit [31:0] CBUS_DO;
@@ -212,12 +298,19 @@ module SH7604
 		if (!RST_N) begin
 			RES_SYNC_N <= 0;
 		end
+		else if (SS_SHIFT) begin
+			RES_SYNC_N <= ss_res[0];
+		end
 		else begin	
 			if (CE_R) begin
 				RES_SYNC_N <= RES_N;
 			end
 		end
 	end
+	
+	// The reset branches of the blocks below are not CE-gated; they are held off while the
+	// chain is partly shifted.
+	wire       RES_INT_N = RES_SYNC_N | ss_rot;
 	
 	SH_core core
 	(
@@ -226,7 +319,7 @@ module SH7604
 		.CE(CE_R),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		.NMI_N(NMI_N),
 		
 		.BUS_A(CBUS_A),
@@ -253,7 +346,16 @@ module SH7604
 		.VECT_REQ(VECT_REQ),
 		.VECT_WAIT(VECT_WAIT),
 		
-		.SLEEP(SLEEP)
+		.SLEEP(SLEEP),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_mult_so),
+		.SS_SO(ss_core_so),
+		.SS_REG_SEL(ss_regs),
+		.SS_REG_N(SS_ADDR[4:0]),
+		.SS_REG_WE(ss_regs & SS_WR_EN),
+		.SS_REG_D(SS_WR_DATA),
+		.SS_REG_Q(ss_regs_q)
 `ifdef DEBUG
 		,
 		.DBG_REGN(DBG_REGN),
@@ -274,7 +376,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		
 		.CBUS_A(CBUS_A),
 		.CBUS_DI(MULT_DI),
@@ -287,7 +389,11 @@ module SH7604
 		.MAC_SEL(MAC_SEL),
 		.MAC_OP(MAC_OP),
 		.MAC_S(MAC_S),
-		.MAC_WE(MAC_WE)
+		.MAC_WE(MAC_WE),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_divu_so),
+		.SS_SO(ss_mult_so)
 	);
 	
 
@@ -300,7 +406,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		
 		.CBUS_A(CBUS_A),
 		.CBUS_DI(CACHE_DI),
@@ -321,7 +427,18 @@ module SH7604
 		.IBUS_PREREQ(IBUS_PREREQ),
 		.IBUS_BURST(IBUS_BURST),
 		.IBUS_LOCK(IBUS_LOCK),
-		.IBUS_WAIT(IBUS_WAIT)
+		.IBUS_WAIT(IBUS_WAIT),
+		
+		.SS_ROT(ss_rot),
+		.SS_TAG(ss_tag),
+		.SS_DATA(ss_data),
+		.SS_A(ss_cache_a),
+		.SS_WE(SS_WR_EN),
+		.SS_D(SS_WR_DATA),
+		.SS_Q(ss_cache_q),
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_chain_in),
+		.SS_SO(ss_cache_so)
 	);
 	
 	assign IBUS_DI = INTC_ACT ? INTC_DO : 
@@ -350,7 +467,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		
 		.IBUS_A(IBUS_A),
 		.IBUS_DI(IBUS_DO),
@@ -361,13 +478,17 @@ module SH7604
 		.IBUS_BUSY(),
 		.IBUS_ACT(UBC_ACT),
 		
-		.IRQ(UBC_IRQ)
+		.IRQ(UBC_IRQ),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_msby_so),
+		.SS_SO(ss_ubc_so)
 	);
 	
 	
 	//Clock divider
+	bit [12:0] DIV_CNT;
 	always @(posedge CLK or negedge RST_N) begin
-		bit [12:0] DIV_CNT;
 		
 		if (!RST_N) begin
 			CLK2_CE <= 0;
@@ -385,7 +506,11 @@ module SH7604
 			CLK8192_CE <= 0;
 			DIV_CNT <= '0;
 		end
-		else if (!RES_SYNC_N) begin
+		else if (SS_SHIFT) begin
+			{DIV_CNT, CLK2_CE, CLK4_CE, CLK8_CE, CLK16_CE, CLK32_CE, CLK64_CE, CLK128_CE, CLK256_CE,
+			 CLK512_CE, CLK1024_CE, CLK2048_CE, CLK4096_CE, CLK8192_CE} <= ss_div[25:0];
+		end
+		else if (!RES_INT_N) begin
 			CLK2_CE <= 0;
 			CLK4_CE <= 0;
 			CLK8_CE <= 0;
@@ -435,7 +560,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		.NMI_N(NMI_N),
 		
 		.DREQ0(DREQ0),
@@ -469,7 +594,11 @@ module SH7604
 		.DMAC0_IRQ(DMAC0_IRQ),
 		.DMAC0_VEC(DMAC0_VEC),
 		.DMAC1_IRQ(DMAC1_IRQ),
-		.DMAC1_VEC(DMAC1_VEC)
+		.DMAC1_VEC(DMAC1_VEC),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_intc_so),
+		.SS_SO(ss_dmac_so)
 	);
 	
 	bit  [26:0] IA;
@@ -495,7 +624,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		
 		.CLK4_CE(CLK4_CE),
 		.CLK16_CE(CLK16_CE),
@@ -557,13 +686,22 @@ module SH7604
 		.CACK(BSC_ACK),
 		.BUS_RLS(BUS_RLS),
 		
-		.FAST(FAST)
+		.FAST(FAST),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_cache_so),
+		.SS_SO(ss_bsc_so),
+		.SS_IDLE(ss_bsc_idle)
 	);
 	
 	assign {A,DO}                                 = !BUS_RLS ? {IA,IDO}                                     : {EA,EDO};
 	assign IDI                                    = !BUS_RLS ? DI                                           : EDO;
-	assign {BS_N,CS0_N,CS1_N,CS2_N,CS3_N}         = !BUS_RLS ? {IBS_N,ICS0_N,ICS1_N,ICS2_N,ICS3_N}          : {EBS_N,ECS0_N,ECS1_N,ECS2_N,ECS3_N};
-	assign {RD_WR_N,CE_N,OE_N,WE_N,RD_N,IVECF_N}  = !BUS_RLS ? {IRD_WR_N,ICE_N,IOE_N,IWE_N,IRD_N,IIVECF_N}  : {ERD_WR_N,ECE_N,EOE_N,EWE_N,ERD_N,EIVECF_N};
+	// While the savestate chain shifts through their flops, the select and read/write
+	// strobes are held inactive, as they are at the T0 park point. BS_N may be low at T0
+	// after an SDRAM burst; the 32X only samples it with CE_F, so it is left alone.
+	assign BS_N                                   = !BUS_RLS ? IBS_N                                        : EBS_N;
+	assign {CS0_N,CS1_N,CS2_N,CS3_N}              = (!BUS_RLS ? {ICS0_N,ICS1_N,ICS2_N,ICS3_N}               : {ECS0_N,ECS1_N,ECS2_N,ECS3_N}) | {4{ss_rot}};
+	assign {RD_WR_N,CE_N,OE_N,WE_N,RD_N,IVECF_N}  = (!BUS_RLS ? {IRD_WR_N,ICE_N,IOE_N,IWE_N,IRD_N,IIVECF_N}  : {ERD_WR_N,ECE_N,EOE_N,EWE_N,ERD_N,EIVECF_N}) | {9{ss_rot}};
 	assign EDI = DI;
 	
 	
@@ -575,7 +713,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		.NMI_N(NMI_N),
 		.IRL_N(IRL_N),
 		
@@ -619,7 +757,11 @@ module SH7604
 		.VBUS_A(VBUS_A),
 		.VBUS_DI(VBUS_DO),
 		.VBUS_REQ(VBUS_REQ),
-		.VBUS_WAIT(BSC_VBUS_BUSY)
+		.VBUS_WAIT(BSC_VBUS_BUSY),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_frt_so),
+		.SS_SO(ss_intc_so)
 	);
 	
 	SH7604_DIVU divu
@@ -630,7 +772,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		
 		.IBUS_A(IBUS_A),
 		.IBUS_DI(IBUS_DO),
@@ -642,7 +784,12 @@ module SH7604
 		.IBUS_ACT(DIVU_ACT),
 		
 		.IRQ(DIVU_IRQ),
-		.VEC(DIVU_VEC)
+		.VEC(DIVU_VEC),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_dmac_so),
+		.SS_SO(ss_divu_so),
+		.SS_IDLE(ss_divu_idle)
 	);
 
 	SH7604_SCI #(SCI_DISABLE) sci
@@ -653,7 +800,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		
 		.RXD(RXD),
 		.TXD(TXD),
@@ -677,7 +824,11 @@ module SH7604
 		.TEI_IRQ(TEI_IRQ),
 		.TXI_IRQ(TXI_IRQ),
 		.RXI_IRQ(RXI_IRQ),
-		.ERI_IRQ(ERI_IRQ)
+		.ERI_IRQ(ERI_IRQ),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_ubc_so),
+		.SS_SO(ss_sci_so)
 	);
 	
 	SH7604_FRT frt
@@ -688,7 +839,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		.SBY(MSBY_SBY),
 		
 		.FTOA(FTOA),
@@ -713,7 +864,11 @@ module SH7604
 		.ICI_IRQ(ICI_IRQ),
 		.OCIA_IRQ(OCIA_IRQ),
 		.OCIB_IRQ(OCIB_IRQ),
-		.OVI_IRQ(OVI_IRQ)
+		.OVI_IRQ(OVI_IRQ),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_wdt_so),
+		.SS_SO(ss_frt_so)
 	);
 	
 	SH7604_WDT #(WDT_DISABLE) wdt
@@ -724,7 +879,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		.SBY(MSBY_SBY),
 		.NMI(INTC_NMI_REQ),
 		
@@ -751,7 +906,11 @@ module SH7604
 		.ITI_IRQ(ITI_IRQ),
 		.OVF(WDT_OVF),
 		.PRES(WDT_PRES),
-		.MRES(WDT_MRES)
+		.MRES(WDT_MRES),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_sci_so),
+		.SS_SO(ss_wdt_so)
 	);
 	
 	SH7604_MSBY msby
@@ -762,7 +921,7 @@ module SH7604
 		.CE_F(CE_F),
 		.EN(EN),
 		
-		.RES_N(RES_SYNC_N),
+		.RES_N(RES_INT_N),
 		
 		.IBUS_A(IBUS_A),
 		.IBUS_DI(IBUS_DO),
@@ -775,7 +934,16 @@ module SH7604
 		
 		.SLEEP(SLEEP),
 		.WDT_OVF(WDT_OVF),
-		.SBY(MSBY_SBY)
+		.SBY(MSBY_SBY),
+		
+		.SS_SHIFT(SS_SHIFT),
+		.SS_SI(ss_bsc_so),
+		.SS_SO(ss_msby_so)
 	);
+	
+	assign ss_res  = {RES_SYNC_N, ss_div[26+31:26]};
+	assign ss_div  = {DIV_CNT, CLK2_CE, CLK4_CE, CLK8_CE, CLK16_CE, CLK32_CE, CLK64_CE, CLK128_CE, CLK256_CE,
+	                  CLK512_CE, CLK1024_CE, CLK2048_CE, CLK4096_CE, CLK8192_CE, ss_padc[SS_PAD+31:SS_PAD]};
+	assign ss_padc = {ss_pad, ss_core_so};
 	
 endmodule

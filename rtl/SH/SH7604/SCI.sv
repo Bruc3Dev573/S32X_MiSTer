@@ -31,7 +31,11 @@ module SH7604_SCI
 	output            TEI_IRQ,
 	output            TXI_IRQ,
 	output            RXI_IRQ,
-	output            ERI_IRQ
+	output            ERI_IRQ,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
@@ -52,6 +56,28 @@ module SH7604_SCI
 	bit         SCE_R;
 	bit         SCE_F;
 	bit         TX_RUN;
+	bit  [12:0] CNT;
+	bit         SCKI_OLD;
+	bit   [3:0] TBIT_CNT;
+	bit         TX_PB;
+	bit         TX_PRERUN;
+	bit   [3:0] RBIT_CNT;
+	bit         REC_END;
+	bit         RX_PB;
+	bit         RX_RUN;
+	
+	// Savestate chain: baud generator, SCK, transmitter, receiver, registers, then SS_SI.
+	// SSR.MPB never sets; SSR.RDRF always equals RXI and loads from the same bit; REG_DO is
+	// dead at the park.
+`define SS_SCI_BRG {CNT, SCKI_OLD, INT_CE_R, INT_CE_F, EXT_CE_R, EXT_CE_F}
+`define SS_SCI_TX  {TXD, SSR.TDRE, SSR.TEND, TSR, TXI, TEI, TBIT_CNT, TX_PB, TX_PRERUN, TX_RUN}
+`define SS_SCI_RX  {RDR, RSR, SSR.ORER, SSR.FER, SSR.PER, SSR.MPBT, RXI, ERI, RX_RUN, RBIT_CNT, REC_END, RX_PB}
+`define SS_SCI_REG {SMR, SCR, BRR, TDR}
+	wire [18+31:0] ss_brg;
+	wire [ 1+31:0] ss_sck;
+	wire [20+31:0] ss_tx;
+	wire [29+31:0] ss_rx;
+	wire [32+31:0] ss_reg;
 	
 	wire REG_SEL = (IBUS_A >= 32'hFFFFFE00 && IBUS_A <= 32'hFFFFFE05);
 //	wire SSR_READ = REG_SEL && IBUS_A[2:0] == 3'h4 && !IBUS_WE && IBUS_REQ;
@@ -64,9 +90,7 @@ module SH7604_SCI
 	bit         EXT_CE_R;
 	bit         EXT_CE_F;
 	always @(posedge CLK or negedge RST_N) begin
-		bit   [12:0] CNT;
 		bit         CS_CE;
-		bit         SCKI_OLD;
 		
 		if (!RST_N) begin
 			// synopsys translate_off
@@ -77,6 +101,9 @@ module SH7604_SCI
 			// synopsys translate_on
 			CNT <= '0;
 			SCKI_OLD <= 0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_SCI_BRG <= ss_brg[17:0];
 		end
 		else if (EN && CE_R && !DISABLE) begin
 			case (SMR.CKS)
@@ -123,6 +150,9 @@ module SH7604_SCI
 			INT_SCK <= 1;
 			// synopsys translate_on
 		end
+		else if (SS_SHIFT) begin
+			INT_SCK <= ss_sck[0];
+		end
 		else begin
 			if (!RES_N) begin
 				INT_SCK <= 1;
@@ -140,10 +170,7 @@ module SH7604_SCI
 	
 	//Transmitter
 	always @(posedge CLK or negedge RST_N) begin
-		bit [3:0] TBIT_CNT;
 		bit       LAST_BIT;
-		bit       PB;
-		bit       TX_PRERUN;
 		
 		if (!RST_N) begin
 			// synopsys translate_off
@@ -156,6 +183,9 @@ module SH7604_SCI
 			TBIT_CNT <= '0;
 			TX_RUN <= 0;
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			`SS_SCI_TX <= ss_tx[19:0];
 		end
 		else begin
 			if (!RES_N) begin
@@ -207,15 +237,15 @@ module SH7604_SCI
 						end else begin
 							if (TBIT_CNT == 4'd0) begin
 								TXD <= 0;
-								PB <= 0;
+								TX_PB <= 0;
 								TBIT_CNT <= TBIT_CNT + 4'd1;
 							end else if (TBIT_CNT <= 4'd8) begin
 								TXD <= TSR[0];
 								TSR <= {1'b0,TSR[7:1]};
-								PB <= PB + TSR[0];
+								TX_PB <= TX_PB + TSR[0];
 								TBIT_CNT <= SMR.PE || TBIT_CNT != 4'd8 ? TBIT_CNT + 4'd1 : TBIT_CNT + 4'd2;
 							end else if (TBIT_CNT == 4'd9) begin
-								TXD <= PB ^ ~SMR.OE;
+								TXD <= TX_PB ^ ~SMR.OE;
 								TBIT_CNT <= SMR.STOP ? TBIT_CNT + 4'd1 : TBIT_CNT + 4'd2;
 							end else begin
 								TXD <= 1;
@@ -229,12 +259,8 @@ module SH7604_SCI
 	end
 	
 	//Receiver
-	bit RX_RUN;
 	always @(posedge CLK or negedge RST_N) begin
-		bit [3:0] RBIT_CNT;
 		bit       LAST_BIT;
-		bit       REC_END;
-		bit       PB;
 		
 		if (!RST_N) begin
 			// synopsys translate_off
@@ -252,6 +278,10 @@ module SH7604_SCI
 			RBIT_CNT <= '0;
 			REC_END <= 0;
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			`SS_SCI_RX <= ss_rx[28:0];
+			SSR.RDRF <= ss_rx[8];
 		end
 		else begin
 			if (!RES_N) begin
@@ -287,15 +317,15 @@ module SH7604_SCI
 					end else begin
 						if (RBIT_CNT == 4'd0) begin
 							if (!RXD) begin
-								PB <= 0;
+								RX_PB <= 0;
 								RBIT_CNT <= RBIT_CNT + 4'd1;
 							end
 						end else if (RBIT_CNT <= 4'd8) begin
 							RSR <= {RXD,RSR[7:1]};
-							PB <= PB + RXD;
+							RX_PB <= RX_PB + RXD;
 							RBIT_CNT <= SMR.PE || RBIT_CNT != 4'd8 ? RBIT_CNT + 4'd1 : RBIT_CNT + 4'd2;
 						end else if (RBIT_CNT == 4'd9) begin
-							SSR.PER <= PB ^ RXD;
+							SSR.PER <= RX_PB ^ RXD;
 							RBIT_CNT <= SMR.STOP ? RBIT_CNT + 4'd1 : RBIT_CNT + 4'd2;
 						end else begin
 							SSR.FER <= ~RXD;
@@ -362,6 +392,9 @@ module SH7604_SCI
 			BRR <= BRR_INIT;
 			// synopsys translate_on
 		end
+		else if (SS_SHIFT) begin
+			`SS_SCI_REG <= ss_reg[31:0];
+		end
 		else begin
 			if (!RES_N) begin
 				TDR <= TDR_INIT;
@@ -411,5 +444,16 @@ module SH7604_SCI
 	assign IBUS_DO = REG_SEL ? REG_DO : 8'h00;
 	assign IBUS_BUSY = 0;
 	assign IBUS_ACT = REG_SEL;
+	
+	assign ss_brg = {`SS_SCI_BRG, ss_sck[1+31:1]};
+	assign ss_sck = {INT_SCK,     ss_tx[20+31:20]};
+	assign ss_tx  = {`SS_SCI_TX,  ss_rx[29+31:29]};
+	assign ss_rx  = {`SS_SCI_RX,  ss_reg[32+31:32]};
+	assign ss_reg = {`SS_SCI_REG, SS_SI};
+	assign SS_SO  = ss_brg[18+31:18];
+`undef SS_SCI_BRG
+`undef SS_SCI_TX
+`undef SS_SCI_RX
+`undef SS_SCI_REG
 	
 endmodule

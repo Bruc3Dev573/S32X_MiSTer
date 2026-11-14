@@ -65,11 +65,14 @@ package SH2_PKG;
 		UCB = 2'b10
 	} BranchType_t;
 	
-	
+	// The decoded-instruction fields below are plain vectors, not the enum types above:
+	// the pipeline copies pass through the savestate chain, where they hold arbitrary codes
+	// while it shifts, and Quartus treats out-of-range enum codes as don't-care (the
+	// logic it builds for them need not hold the registers without a clock enable).
 	typedef struct packed
 	{
-		RegSource_t  RSA;		//REGA source
-		RegSource_t  RSB;		//REGB source
+		bit [2:0]    RSA;		//REGA source (RegSource_t)
+		bit [2:0]    RSB;		//REGB source (RegSource_t)
 		bit          RSC;		//REGC source (0-R0, 1-IMM)
 		bit          PCM;		//PC masked
 		bit          BPWBA;	//Bypass register A from WB.RES
@@ -84,15 +87,15 @@ package SH2_PKG;
 	{
 		bit          SA;
 		bit          SB;
-		ALUType_t    OP;		//ALU operation type
+		bit [2:0]    OP;		//ALU operation type (ALUType_t)
 		bit [3:0]    CD;		//ALU operation code
 		bit [2:0]    CMP;		//CMP operation code
 	} ALU_t;
 	
 	typedef struct packed
 	{
-		AddrSrc_t    ADDS;	//Address source
-		AddrSrc_t    WDS;		//Write data source
+		bit [1:0]    ADDS;	//Address source (AddrSrc_t)
+		bit [1:0]    WDS;		//Write data source (AddrSrc_t)
 		bit [1:0]    SZ;		//Memory access size
 		bit          R;		//Data memory read
 		bit          W;		//Data memory write
@@ -116,14 +119,14 @@ package SH2_PKG;
 	typedef struct packed
 	{
 		bit          W;		//System control register write
-		CtrlReg_t    S;		//System control register select
-		SRSet_t      SRS;		//SR register set
+		bit [1:0]    S;		//System control register select (CtrlReg_t)
+		bit [2:0]    SRS;		//SR register set (SRSet_t)
 	} Control_t;
 	
 	typedef struct packed
 	{
 		bit          BI;		//Branch instruction
-		BranchType_t BT;		//Branch type
+		bit [1:0]    BT;		//Branch type (BranchType_t)
 		bit          BD;		//Branch delayed
 		bit          BCV;		//Branch condition value
 		bit          BSR;		//Branch subrouting
@@ -132,7 +135,7 @@ package SH2_PKG;
 	typedef struct packed
 	{
 		Datapath_t   DP;
-		IMMType_t    IMMT;	//Immediate type
+		bit [2:0]    IMMT;	//Immediate type (IMMType_t)
 		ALU_t        ALU;
 		Mem_t        MEM;
 		Reg_t        RA;

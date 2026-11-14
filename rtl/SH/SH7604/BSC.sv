@@ -70,8 +70,12 @@ module SH7604_BSC
 	output reg        CACK,
 	output            BUS_RLS,
 	
-	input             FAST
+	input             FAST,
 	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO,
+	output            SS_IDLE
 );
 
 	import SH7604_PKG::*;
@@ -195,27 +199,54 @@ module SH7604_BSC
 	bit  [31: 0] DAT_BUF;
 	bit  [ 7: 0] VEC_BUF;
 	bit  [ 1: 0] RFS_WAIT_CNT;
+	bit          DBUS_SKIP;
+	bit          CBUS_LOCK_INT,DBUS_LOCK_INT;
+	bit  [ 1: 0] CBUS_REQ_CNT;
+	bit  [ 2: 0] WAIT_CNT;
+	bit  [ 1: 0] RCD_WAIT_CNT;
+	bit  [ 1: 0] NOP_WAIT_CNT;
+	bit  [31: 0] BUS_DI_LATCH;
+	bit          BUS_WE_LATCH;
+	bit  [ 3: 0] NEXT_BA;
+	bit  [ 2: 0] BURST_CNT;
+	bit          BURST_EN,BURST_SINGLE;
+	bit          SDRAM_PRECHARGE_PEND,SDRAM_INSERT_NOP,INSERT_WAIT;
+	bit          DELAYED_RFS_REQ;
+	bit          MST_BUS_RLS;
+	bit          SLV_BUS_RLS;
+	
+	// Savestate chain: bus state machine, arbitration, registers, then SS_SI. The park
+	// happens only at T0 (SS_IDLE), so BUS_STATE is T0 in every image and stays out of the
+	// chain: as an enum, Quartus treats its out-of-range codes as don't-care states, and the
+	// shifting chain would load such codes. Not saved: DO[31:16] and
+	// WE_N[3:2] (the 32X wires a 16-bit bus), IVECF_N and CACK (unconnected on the 32X,
+	// IVECF_N is high and CACK low at T0), WAIT_CNT, RCD_WAIT_CNT and RFS_WAIT_CNT (reloaded
+	// on the way out of T0), NEXT_BA[3] (never set), NEXT_BA[2] and BUS_DI_LATCH[31:16] when
+	// byte areas are disabled, BUS_DI_LATCH[31:24] (never read) and REG_DO (dead at the park).
+	localparam SS_NBA = SIZE_BYTE_DISABLE ? 1 : 2;
+	localparam SS_DIL = SIZE_BYTE_DISABLE ? 15 : 23;
+	localparam SS_W_BUS = 136 + SS_NBA - 1 + SS_DIL - 15;
+`define SS_BSC_BUS {A, DO[15:0], BS_N, CS0_N, CS1_N, CS2_N, CS3_N, RD_WR_N, RD_N, WE_N[1:0], \
+                    BUSY, CBUSY, CBUSY2, DBUSY, VBUSY, CBUS_ACTIVE, DBUS_ACTIVE, VBUS_ACTIVE, REFRESH_ACTIVE, \
+                    CBUS_REQ_CNT, NEXT_BA[SS_NBA:0], DAT_BUF, VEC_BUF, \
+                    DBUS_SKIP, CBUS_LOCK_INT, DBUS_LOCK_INT, NOP_WAIT_CNT, BUS_DI_LATCH[SS_DIL:0], \
+                    BUS_WE_LATCH, BURST_CNT, BURST_EN, BURST_SINGLE, SDRAM_PRECHARGE_PEND, SDRAM_INSERT_NOP, \
+                    INSERT_WAIT, DELAYED_RFS_REQ}
+`define SS_BSC_ARB {BREQ, BGR, MST_BUS_RLS, SLV_BUS_RLS}
+`define SS_BSC_REG {BCR1[12:4], BCR1[2:0], BCR2[7:2], WCR, MCR[15:9], MCR[7:2], RTCSR[7:3], RTCNT, RTCOR, RFS_REQ}
+	wire [SS_W_BUS+31:0] ss_bus;
+	wire [       4+31:0] ss_arb;
+	wire [      69+31:0] ss_reg;
+	assign SS_IDLE = (BUS_STATE == T0);
+	
 	always @(posedge CLK or negedge RST_N) begin
 		BusState_t  STATE_NEXT;
-		bit         DBUS_SKIP;
-		bit         CBUS_LOCK_INT,DBUS_LOCK_INT;
-		bit [ 1: 0] CBUS_REQ_CNT;
-		bit [ 2: 0] WAIT_CNT;
-		bit [ 1: 0] RCD_WAIT_CNT;
-		bit [ 1: 0] NOP_WAIT_CNT;
-		bit [31: 0] BUS_DI_LATCH;
-		bit         BUS_WE_LATCH;
-		bit [ 3: 0] NEXT_BA;
 		bit [ 1: 0] AREA_SZ;
 		bit         LL;
 		bit         CBUS_IS_SDRAM,DBUS_IS_SDRAM,BUS_IS_SDRAM,IS_SAME_BANK_SDRAM;
 		bit [ 3: 0] SDRAM_AREA;
-		bit [ 2: 0] BURST_CNT;
-		bit         BURST_EN,BURST_SINGLE;
 		bit         BURST_LAST,BURST_PRELAST;
-		bit         SDRAM_PRECHARGE_PEND,SDRAM_INSERT_NOP,INSERT_WAIT;
 		bit         DATA_LATCH;
-		bit         DELAYED_RFS_REQ;
 		
 		if (!RST_N) begin
 			CS0_N <= 1;
@@ -235,6 +266,9 @@ module SH7604_BSC
 			BUS_STATE <= T0;
 			WAIT_CNT <= '0;
 			NEXT_BA <= '0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_BSC_BUS <= ss_bus[SS_W_BUS-1:0];
 		end
 		else begin
 			LL = AREA_TIMIMG[A[26:25]];
@@ -897,14 +931,14 @@ module SH7604_BSC
 	               DBUS_ACTIVE ? !DBUSY && !DBUS_LOCK :
 						CBUS_ACTIVE ? !CBUSY && !CBUS_LOCK :
 						1'b1;
-	bit MST_BUS_RLS;
-	bit SLV_BUS_RLS;
 	always @(posedge CLK or negedge RST_N) begin		
 		if (!RST_N) begin
 			BREQ <= 0;
 			BGR <= 0;
 			MST_BUS_RLS <= 0;
 			SLV_BUS_RLS <= 1;
+		end else if (SS_SHIFT) begin
+			`SS_BSC_ARB <= ss_arb[3:0];
 		end else if (CE_F) begin
 			if (MASTER) begin
 				if (BRLS && !BGR && BUS_STATE == T0 && BUS_END && !MST_BUS_RLS) begin
@@ -970,6 +1004,9 @@ module SH7604_BSC
 			RTCOR <= RTCOR_INIT;
 			RFS_REQ <= 0;
 		end
+		else if (SS_SHIFT) begin
+			`SS_BSC_REG <= ss_reg[68:0];
+		end
 		else if (CE_R) begin
 			if (REG_SEL && CBUS_DI[31:16] == 16'hA55A && CBUS_WE && CBUS_REQ) begin
 				case ({CBUS_A[4:2],2'b00})
@@ -1031,6 +1068,14 @@ module SH7604_BSC
 	assign OE_N = 1;
 	assign CE_N = 1;
 	assign IRQ = 0;
+	
+	assign ss_bus = {`SS_BSC_BUS, ss_arb[4+31:4]};
+	assign ss_arb = {`SS_BSC_ARB, ss_reg[69+31:69]};
+	assign ss_reg = {`SS_BSC_REG, SS_SI};
+	assign SS_SO  = ss_bus[SS_W_BUS+31:SS_W_BUS];
+`undef SS_BSC_BUS
+`undef SS_BSC_ARB
+`undef SS_BSC_REG
 	
 
 endmodule

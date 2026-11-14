@@ -39,7 +39,11 @@ module SH7604_DMAC (
 	output            DMAC0_IRQ,
 	output      [7:0] DMAC0_VEC,
 	output            DMAC1_IRQ,
-	output      [7:0] DMAC1_VEC
+	output      [7:0] DMAC1_VEC,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
@@ -52,6 +56,21 @@ module SH7604_DMAC (
 	VCRDMAx_t   VCRDMA0;
 	VCRDMAx_t   VCRDMA1;
 	DMAOR_t     DMAOR;
+	
+	// Savestate chain: request, arbiter, transfer, registers, then SS_SI. REG_DO is dead
+	// at the park (consumed by the CE_R after it is latched); DRCR is never written
+	// (REG1_SEL is always false); DMAOR.AE never sets and DMAOR.NMIF needs NMI_N, tied
+	// high on the 32X; CH_REQ_CLR and DMA_REQ_CLR clear on the clock after they set.
+`define SS_DMAC_REQ {DREQ0_REQ, DREQ1_REQ, DREQ0_OLD, DREQ1_OLD, CH_REQ[0], CH_REQ[1]}
+`define SS_DMAC_ARB {DMA_REQ, DMA_CH, RB_PRIO}
+`define SS_DMAC_XFR {SAR[0], SAR[1], DAR[0], DAR[1], TCR[0], TCR[1], CHCR[0][15:0], CHCR[1][15:0], \
+                     CHCR_TE_OLD[0], CHCR_TE_OLD[1], DMA_WR, DMA_RD, DMA_BURST, DMA_LOCK, \
+                     RD_BUF[0], RD_BUF[1], RD_BUF[2], RD_BUF[3], LW_CNT, SA_BA, RD_BUF_LATCH}
+`define SS_DMAC_REG {VCRDMA0.VC, VCRDMA1.VC, DMAOR.PR, DMAOR.DME}
+	wire [  6+31:0] ss_req;
+	wire [  3+31:0] ss_arb;
+	wire [347+31:0] ss_xfr;
+	wire [ 18+31:0] ss_reg;
 		
 	function bit [3:0] BAFromAddr(input bit [1:0] addr, input bit [1:0] sz);
 		bit [3:0] res;
@@ -85,18 +104,20 @@ module SH7604_DMAC (
 
 	bit         CH_REQ[2];
 	bit         CH_REQ_CLR[2];
+	bit         DREQ0_REQ;
+	bit         DREQ1_REQ;
+	bit         DREQ0_OLD;
+	bit         DREQ1_OLD;
 	always @(posedge CLK or negedge RST_N) begin
-		bit         DREQ0_REQ;
-		bit         DREQ1_REQ;
-		bit         DREQ0_OLD;
-		bit         DREQ1_OLD;
-		
 		if (!RST_N) begin
 			DREQ0_REQ <= 0;
 			DREQ1_REQ <= 0;
 			DREQ0_OLD <= 0;
 			DREQ1_OLD <= 0;
 			CH_REQ <= '{0,0};
+		end
+		else if (SS_SHIFT) begin
+			`SS_DMAC_REQ <= ss_req[5:0];
 		end
 		else if (CE_R) begin
 			DREQ0_OLD <= DREQ0;
@@ -147,6 +168,9 @@ module SH7604_DMAC (
 			DMA_CH <= 0;
 			RB_PRIO <= 0;
 		end
+		else if (SS_SHIFT) begin
+			`SS_DMAC_ARB <= ss_arb[2:0];
+		end
 		else if (CE_R) begin
 			if (!DMA_REQ) begin
 				if ((CH_REQ[0] && CH_EN[0] && CH_AVAIL[0]) && 
@@ -177,11 +201,11 @@ module SH7604_DMAC (
 	bit  [31:0] RD_BUF[4];
 	bit   [1:0] LW_CNT;
 	bit   [1:0] SA_BA;
+	bit         RD_BUF_LATCH;
+	bit         CHCR_TE_OLD[2];
 	always @(posedge CLK or negedge RST_N) begin
 		bit  [31:0] AR_INC;
 		bit  [23:0] TCR_NEXT;
-		bit         RD_BUF_LATCH;
-		bit         CHCR_TE_OLD[2];
 		
 		if (!RST_N) begin
 			SAR <= '{2{SARx_INIT}};
@@ -198,6 +222,9 @@ module SH7604_DMAC (
 			DMA_REQ_CLR <= 0;
 			LW_CNT <= '0;
 			RD_BUF_LATCH <= 0;
+		end
+		else if (SS_SHIFT) begin
+			`SS_DMAC_XFR <= ss_xfr[346:0];
 		end
 		else begin
 			AR_INC = GetAddrInc(CHCR[DMA_CH].TS);
@@ -397,6 +424,9 @@ module SH7604_DMAC (
 			DMAOR.DME <= 1;
 			// synopsys translate_on
 		end
+		else if (SS_SHIFT) begin
+			`SS_DMAC_REG <= ss_reg[17:0];
+		end
 		else if (CE_R) begin
 			if (!RES_N) begin
 				DRCR[0] <= DRCRx_INIT;
@@ -459,6 +489,16 @@ module SH7604_DMAC (
 	
 	assign IBUS_DO = REG1_SEL || REG2_SEL ? REG_DO : '0;
 	assign IBUS_ACT = REG1_SEL | REG2_SEL;
+	
+	assign ss_req = {`SS_DMAC_REQ, ss_arb[3+31:3]};
+	assign ss_arb = {`SS_DMAC_ARB, ss_xfr[347+31:347]};
+	assign ss_xfr = {`SS_DMAC_XFR, ss_reg[18+31:18]};
+	assign ss_reg = {`SS_DMAC_REG, SS_SI};
+	assign SS_SO  = ss_req[6+31:6];
+`undef SS_DMAC_REQ
+`undef SS_DMAC_ARB
+`undef SS_DMAC_XFR
+`undef SS_DMAC_REG
 	
 
 endmodule

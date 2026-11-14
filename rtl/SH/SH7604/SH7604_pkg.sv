@@ -501,4 +501,7 @@ package SH7604_PKG;
 	parameter bit [7:0] SBYCR_RMASK = 8'hDF;
 	parameter bit [7:0] SBYCR_INIT = 8'h00;
 	
+	//Savestate image of one SH7604 in 32-bit words (layout in SH7604.sv)
+	parameter int SS_IMAGE_SIZE = 'h600;
+	
 endpackage

@@ -49,7 +49,19 @@ module S32X_VDP
 	output            YSO_N,	//0 - 32X pixel, 1 - MD pixel
 	output            HBL,
 	
-	output reg  [7:0] DBG_DOT_TIME
+	output reg  [7:0] DBG_DOT_TIME,
+	
+	// Savestate (driven by 32X.sv). SS_SEL: the S32X_PKG::SS_VDP_SIZE register words,
+	// SS_PAL_SEL: the 256 palette words; SS_ADDR is the word inside the region.
+	input             SS_PHASE_HOLD,	// freeze the latches taken from the raster
+	input             SS_ACTIVE,		// everything parked: palette port B is taken over
+	input             SS_SEL,
+	input             SS_PAL_SEL,
+	input       [7:0] SS_ADDR,
+	input             SS_WR_EN,
+	input      [31:0] SS_WR_DATA,
+	output     [31:0] SS_RD_DATA,
+	output            SS_QUIET		// no access or framebuffer write in flight
 );
 	import S32X_PKG::*;
 	
@@ -103,10 +115,23 @@ module S32X_VDP
 	bit        PAL_ACCESS;
 	bit        FILL_EXEC;
 	bit  [1:0] FILL_WAIT;
+	bit  [7:0] FILL_CNT;
+	bit        FILL_PEND;
+	bit  [2:0] ACCESS_WAIT;
+	bit  [5:0] RFRH_CNT;
+	
+	// Savestate image of the VDP, S32X_PKG::SS_VDP_SIZE words; fields right-aligned,
+	// unused bits 0. Word 2 holds the latches taken from the raster, frozen with it by
+	// SS_PHASE_HOLD (VBLK and VINT too: they depend on the latched M240), and DO, which
+	// the side not owning the VDP (ADCR.FM) reads as it was left. PEN is not in the
+	// image: it follows the raster and is recomputed while everything is parked.
+	`define VDP_SS_W0 {AFAR,AFLR,BMMR.PRI,BMMR.M240,BMMR.M,PPCR.SFT,FBCR.FS}
+	`define VDP_SS_W1 {AFDR,FILL_CNT,FILL_PEND,FILL_EXEC,FILL_WAIT,ACCESS_WAIT}
+	`define VDP_SS_W2 {DO,MODE,PRI,M240,SFT,FS,RFRH,RFRH_CNT,VBLK,VINT}
+	// The engine holds SS_WR_EN for 2 clocks; every load write is idempotent.
+	wire [2:0] ss_we = {3{SS_SEL & SS_WR_EN}} & (3'd1 << SS_ADDR[1:0]);
+	
 	always @(posedge CLK or negedge RST_N) begin
-		bit  [7:0] FILL_CNT;
-		bit        FILL_PEND;
-		bit  [2:0] ACCESS_WAIT;
 		
 		if (!RST_N) begin
 			BMMR <= BMMR_INIT;
@@ -204,6 +229,11 @@ module S32X_VDP
 					if (!FILL_CNT) FILL_EXEC <= 0;
 				end
 			end
+			
+			// Savestate load, after everything above so the image wins.
+			if (ss_we[0]) `VDP_SS_W0 <= SS_WR_DATA[29:0];
+			if (ss_we[1]) `VDP_SS_W1 <= SS_WR_DATA[30:0];
+			if (ss_we[2]) DO <= SS_WR_DATA[30:15];
 		end
 	end
 	
@@ -314,10 +344,13 @@ module S32X_VDP
 						V_CNT <= V_CNT + 9'd1;
 					end
 					
-					if ((V_CNT == 9'd223 && (!M240 || !PAL)) || (V_CNT == 9'd239 && M240 && PAL)) begin
-						VINT <= 1;
-					end else if ((V_CNT == 9'd261 && !PAL) || (V_CNT == 9'd312 && PAL)) begin
-						VINT <= 0;
+					// VINT depends on the latched M240: held with it during a savestate.
+					if (!SS_PHASE_HOLD) begin
+						if ((V_CNT == 9'd223 && (!M240 || !PAL)) || (V_CNT == 9'd239 && M240 && PAL)) begin
+							VINT <= 1;
+						end else if ((V_CNT == 9'd261 && !PAL) || (V_CNT == 9'd312 && PAL)) begin
+							VINT <= 0;
+						end
 					end
 				end
 				
@@ -325,6 +358,8 @@ module S32X_VDP
 					DBG_DOT_TIME <= '0;
 				end
 			end
+			
+			if (ss_we[2]) VINT <= SS_WR_DATA[0];
 		end
 	end
 	
@@ -337,46 +372,54 @@ module S32X_VDP
 			VBLK <= 0;
 			HDISP <= '{0,0,0};
 		end
-		else if (DOT_CE) begin
-			if (H_CNT == 9'h017-1) begin
-				HBLK <= 0;
-				HDISP[0] <= ~VBLK;
-			end else if (H_CNT == 9'h157-1) begin
-				HBLK <= 1;
-				HDISP[0] <= 0;
-			end
-			HDISP[1] <= HDISP[0];
-			HDISP[2] <= HDISP[1];
-			
-			if (H_CNT == 9'h1CE-1) begin
-				if ((V_CNT >= 9'd224 && (!M240 || !PAL)) || (V_CNT >= 9'd240 && M240 && PAL)) begin
-					VBLK <= 1;
-				end else if (V_CNT == 9'd0) begin
-					VBLK <= 0;
+		else begin
+			if (DOT_CE) begin
+				if (H_CNT == 9'h017-1) begin
+					HBLK <= 0;
+					HDISP[0] <= ~VBLK;
+				end else if (H_CNT == 9'h157-1) begin
+					HBLK <= 1;
+					HDISP[0] <= 0;
+				end
+				HDISP[1] <= HDISP[0];
+				HDISP[2] <= HDISP[1];
+				
+				// VBLK depends on the latched M240: held with it during a savestate.
+				if (H_CNT == 9'h1CE-1 && !SS_PHASE_HOLD) begin
+					if ((V_CNT >= 9'd224 && (!M240 || !PAL)) || (V_CNT >= 9'd240 && M240 && PAL)) begin
+						VBLK <= 1;
+					end else if (V_CNT == 9'd0) begin
+						VBLK <= 0;
+					end
 				end
 			end
+			
+			if (ss_we[2]) VBLK <= SS_WR_DATA[1];
 		end
 	end
 	
 	assign HINT = HBLK;
 	
 	always @(posedge CLK or negedge RST_N) begin
-		bit  [5:0] RFRH_CNT;
-		
 		if (!RST_N) begin
 			RFRH <= 0;
 			RFRH_CNT <= '0;
 		end
 		else begin
-			if (H_CNT == 9'h158-1 && DOT_CE) begin
+			if (H_CNT == 9'h158-1 && DOT_CE && !SS_PHASE_HOLD) begin
 				RFRH <= 1;
 				RFRH_CNT <= 6'd39;
 			end else if (RFRH && CE_R) begin
 				RFRH_CNT <= RFRH_CNT - 6'd1;
 				if (!RFRH_CNT) RFRH <= 0;
 			end
+			
+			if (ss_we[2]) {RFRH,RFRH_CNT} <= SS_WR_DATA[8:2];
 		end
 	end
+	
+	// PEN as the line logic below leaves it after a whole line with the current MODE/VBLK.
+	wire PEN_LINE = VBLK | ~MODE[0] | ~(H_CNT >= 9'h017 && H_CNT <= 9'h157+3-1);
 	
 	wire REG_LATCH_HTIME = H_CNT >= 9'h157;
 	always @(posedge CLK or negedge RST_N) begin		
@@ -390,21 +433,31 @@ module S32X_VDP
 		end
 		else begin
 			if (DOT_CE) begin
-				if (REG_LATCH_HTIME) begin
-					MODE <= BMMR.M;
-					PRI <= BMMR.PRI;
-					M240 <= BMMR.M240;
-					SFT <= PPCR.SFT;
+				// Held with the raster phase during a savestate.
+				if (!SS_PHASE_HOLD) begin
+					if (REG_LATCH_HTIME) begin
+						MODE <= BMMR.M;
+						PRI <= BMMR.PRI;
+						M240 <= BMMR.M240;
+						SFT <= PPCR.SFT;
+					end
+					
+					if (VBLK || MODE == 2'b0) FS <= FBCR.FS;
 				end
 				
-				if (VBLK || MODE == 2'b0) FS <= FBCR.FS;
-				
+				// Not held, so a palette access waiting for PEN still ends while the
+				// SH-2s run on to their park.
 				if (H_CNT == 9'h157+3-1 || VBLK || !MODE[0]) begin
 					PEN <= 1;
 				end else if (H_CNT == 9'h017-1) begin
 					PEN <= 0;
 				end
+			end else if (SS_ACTIVE) begin
+				// Everything parked: recompute it from the (possibly just loaded) MODE/VBLK.
+				PEN <= PEN_LINE;
 			end
+			
+			if (ss_we[2]) {MODE,PRI,M240,SFT,FS} <= SS_WR_DATA[14:9];
 		end
 	end
 	
@@ -461,16 +514,17 @@ module S32X_VDP
 	wire  [7:0] PAL_DISP_A = PIX_BYTE ? PIX_DATA[7:0] : PIX_DATA[15:8];
 	bit  [15:0] PAL_DISP_Q;
 	
-	wire  [7:0] PAL_IO_A = A[8:1];
-	wire [15:0] PAL_IO_D = DI;
-	wire        PAL_IO_WE = ~LWR_N & ~UWR_N & PAL_ACCESS;
+	// Port B is the savestate's while everything is parked (no CPU access in flight).
+	wire  [7:0] PAL_IO_A = SS_ACTIVE ? SS_ADDR : A[8:1];
+	wire [15:0] PAL_IO_D = SS_ACTIVE ? SS_WR_DATA[15:0] : DI;
+	wire        PAL_IO_WE = SS_ACTIVE ? SS_PAL_SEL & SS_WR_EN : ~LWR_N & ~UWR_N & PAL_ACCESS;
 	bit  [15:0] PAL_IO_Q;
 	
 	VDPPAL pal(
 		.CLK(CLK), 
 		.ADDR_A(PAL_DISP_A), 
 		.DATA_A('0), 
-		.WREN_A(0), 
+		.WREN_A(1'b0), 
 		.Q_A(PAL_DISP_Q),
 		
 		.ADDR_B(PAL_IO_A), 
@@ -510,7 +564,9 @@ module S32X_VDP
 	
 	assign FB_DRAW_A  = FILL_EXEC ? AFAR : FB_WR ? FIFO_FB_A[16:1] : A[16:1];
 	assign FB_DRAW_D  = FILL_EXEC ? AFDR : FB_WR ? FIFO_FB_D       : DI;
-	assign FB_DRAW_WE = FILL_EXEC ? {2{FILL_EXEC & (~|FILL_WAIT | USE_ASYNC_FB)}} : {FB_WR & FIFO_FB_WE[1] & ((|FIFO_FB_D[15:8] & FIFO_FB_A[17]) | ((|FIFO_FB_D[15:8] | FIFO_FB_WE[0]) & ~FIFO_FB_A[17])), 
+	// A parked fill writes nothing while the savestate owns the framebuffers (its pending
+	// write was done before the park, it is written again after the release).
+	assign FB_DRAW_WE = FILL_EXEC ? {2{FILL_EXEC & (~|FILL_WAIT | USE_ASYNC_FB) & ~SS_ACTIVE}} : {FB_WR & FIFO_FB_WE[1] & ((|FIFO_FB_D[15:8] & FIFO_FB_A[17]) | ((|FIFO_FB_D[15:8] | FIFO_FB_WE[0]) & ~FIFO_FB_A[17])), 
 	                                                                                 FB_WR & FIFO_FB_WE[0] & ((|FIFO_FB_D[ 7:0] & FIFO_FB_A[17]) | ((|FIFO_FB_D[ 7:0] | FIFO_FB_WE[1]) & ~FIFO_FB_A[17]))};
 	assign FB_DRAW_RD = FILL_EXEC ? 1'b0 : FB_RD;
 	
@@ -526,5 +582,25 @@ module S32X_VDP
 	assign FB1_DO = FB_DRAW_D;
 	assign FB1_WE = FS ? 2'b00      : FB_DRAW_WE;
 	assign FB1_RD = FS ? FB_DISP_RD : FB_DRAW_RD;
+	
+	// Savestate read: registered, valid 1 clock after SS_ADDR changes. A palette word
+	// is valid 1 clock after SS_ADDR changes too (address register of port B).
+	bit [31:0] SS_VDP_Q;
+	always @(posedge CLK) begin
+		case (SS_ADDR[1:0])
+			2'd0:    SS_VDP_Q <= 32'(`VDP_SS_W0);
+			2'd1:    SS_VDP_Q <= 32'(`VDP_SS_W1);
+			2'd2:    SS_VDP_Q <= 32'(`VDP_SS_W2);
+			default: SS_VDP_Q <= '0;
+		endcase
+	end
+	assign SS_RD_DATA = SS_PAL_SEL ? {16'h0000,PAL_IO_Q} : SS_VDP_Q;
+	
+	// The FIFO is drained into the framebuffer and no CPU access is in flight.
+	assign SS_QUIET = FIFO_EMPTY & ~FIFO_FB_WRITE & ACK_N & ~PAL_ACCESS & ~FB_RD;
+	
+	`undef VDP_SS_W0
+	`undef VDP_SS_W1
+	`undef VDP_SS_W2
 	
 endmodule

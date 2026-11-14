@@ -18,12 +18,23 @@ module SH7604_MSBY (
 	
 	input             SLEEP,
 	input             WDT_OVF,
-	output reg        SBY
+	output reg        SBY,
+	
+	input             SS_SHIFT,
+	input      [31:0] SS_SI,
+	output     [31:0] SS_SO
 );
 
 	import SH7604_PKG::*;
 	
 	SBYCR_t     SBYCR;
+	bit          SLEEP_OLD;
+	
+	// Savestate chain. The register readback is not wired to the bus, so only SBYCR.SBY
+	// is live.
+	wire [ 2+31:0] ss_sb = {SBY, SLEEP_OLD, SS_SI};
+	wire [ 1+31:0] ss_cr = {SBYCR.SBY, ss_sb[2+31:2]};
+	assign SS_SO = ss_cr[1+31:1];
 	
 	wire REG_SEL = (IBUS_A == 32'hFFFFFE91);
 	always @(posedge CLK or negedge RST_N) begin
@@ -31,6 +42,9 @@ module SH7604_MSBY (
 			SBYCR <= SBYCR_INIT;
 			// synopsys translate_off
 			// synopsys translate_on
+		end
+		else if (SS_SHIFT) begin
+			SBYCR.SBY <= ss_cr[0];
 		end
 		else if (EN && CE_R) begin
 			if (REG_SEL && IBUS_WE && IBUS_REQ) begin
@@ -40,10 +54,11 @@ module SH7604_MSBY (
 	end
 	
 	always @(posedge CLK or negedge RST_N) begin
-		bit          SLEEP_OLD;
-		
 		if (!RST_N) begin
 			SBY <= 0;
+		end
+		else if (SS_SHIFT) begin
+			{SBY, SLEEP_OLD} <= ss_sb[1:0];
 		end
 		else if (EN && CE_R) begin
 			SLEEP_OLD <= SLEEP;
