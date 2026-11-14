@@ -101,7 +101,10 @@ video_freak video_freak
 
 `include "build_id.v"
 localparam CONF_STR = {
-	"S32X;;",
+	// Four 8 MB savestate slots in DDR3 from 0x3E000000, declared to Main with
+	// SS3E000000:800000 (a Sega Channel image carries 4MB of cartridge memory). The 32X
+	// SDRAM uses DDR3 at 0x30000000.
+	"S32X;SS3E000000:800000;",
 	"FS,32X;",
 	"-;",
 	"O67,Region,JP,US,EU;",
@@ -162,16 +165,41 @@ localparam CONF_STR = {
 	"H3o0,Enable FM,Yes,No;",
 	"H3o1,Enable PSG,Yes,No;",
 	"H3-;",
+	// Savestate controls. Load is status[67], Save is status[66] and the slot is status[65:64].
+	"-;",
+	"R[67],Load State;",
+	"R[66],Save State;",
+	"O[65:64],Savestate Slot,1,2,3,4;",
 	"R0,Reset;",
-	"J1,A,B,C,Start,Mode,X,Y,Z;",
+	// Metadata rows follow the selectable rows because Main skips I rows only when drawing.
+	// Savestate overlay indices: help, slots 1-4, then save/load per slot.
+	"I,",
+	"Slot=DPAD|Save/Load=Mode+DPAD,",
+	"Active Slot 1,",
+	"Active Slot 2,",
+	"Active Slot 3,",
+	"Active Slot 4,",
+	"Save to state 1,",
+	"Restore state 1,",
+	"Save to state 2,",
+	"Restore state 2,",
+	"Save to state 3,",
+	"Restore state 3,",
+	"Save to state 4,",
+	"Restore state 4;",
+	"J1,A,B,C,Start,Mode,X,Y,Z,Savestate;",
 	"jn,A,B,R,Start,Select,X,Y,L;", // name map to SNES layout.
 	"jp,Y,B,A,Start,Select,L,X,R;", // positional map to SNES layout (3 button friendly) 
 	"V,v",`BUILD_DATE
 };
 
-wire [63:0] status;
+// 128 bits because the savestate OSD controls are at status[67:64].
+wire [127:0] status;
+wire        ss_info_req;   // driven by savestate_ui
+wire  [7:0] ss_info;
 wire  [1:0] buttons;
-wire [11:0] joystick_0,joystick_1,joystick_2,joystick_3,joystick_4;
+wire [12:0] joystick_0;    // bit 12 is the Savestate button
+wire [11:0] joystick_1,joystick_2,joystick_3,joystick_4;
 wire  [7:0] joy0_x,joy0_y,joy1_x,joy1_y;
 wire        ioctl_download;
 wire        ioctl_wr;
@@ -199,6 +227,118 @@ wire [24:0] ps2_mouse;
 wire [21:0] gamma_bus;
 wire [15:0] sdram_sz;
 
+// Savestate signals, used by the instances below. The logic is in the Savestates
+// section at the end of this file.
+wire        ssui_status_upd;
+wire  [1:0] ssui_slot;
+wire        ss_busy;
+wire        ss_load_done;
+wire [31:0] ss_state_dout;
+wire        ss_cpu_freeze;
+wire        ss_release_now;
+reg         ss_release_d = 0;   // ss_release_now one clock later: the release of gen and the SVP
+wire        ss_div_ok;
+reg         ss_freeze_active = 0;
+
+wire        ss_m68k_frozen;
+wire  [7:0] ss_m68k_addr;
+wire        ss_m68k_wr_en;
+wire [15:0] ss_m68k_rd_data;
+
+wire  [1:0] ss_gen_mem_sel;
+wire [15:0] ss_gen_mem_addr;
+wire        ss_gen_mem_wr_en;
+wire [15:0] ss_gen_mem_rd_data;
+
+wire  [1:0] ss_vdp_sel;
+wire  [7:0] ss_vdp_addr;
+wire        ss_vdp_wr_en;
+wire [31:0] ss_vdp_rd_data;
+wire        ss_vdp_quiet;
+reg         ss_vdp_resume = 0;
+wire        ss_vdp_phase_ok;
+
+wire  [8:0] ss_fm_addr;
+wire        ss_fm_wr_en;
+wire        ss_fm_rd_en;
+wire [31:0] ss_fm_rd_data;
+wire        ss_fm_ready;
+
+wire         ss_z80_frozen;
+wire [211:0] ss_z80_reg;
+reg  [211:0] ss_z80_dir;
+reg          ss_z80_dirset = 0;
+wire         ss_z80_halt;
+reg          ss_z80_halt_dir;
+wire [119:0] ss_z80_seq;
+wire [119:0] ss_z80_seq_dir;
+wire   [8:0] ss_z80_bar;
+reg    [8:0] ss_z80_bar_dir;
+wire   [1:0] ss_z80_ctrl;
+reg    [1:0] ss_z80_ctrl_dir;
+reg          ss_z80_ext_set = 0;
+
+wire  [2:0] ss_psg_addr;
+wire        ss_psg_wr_en;
+wire [31:0] ss_psg_rd_data;
+
+wire  [2:0] ss_sys_addr;
+wire        ss_sys_wr_en;
+wire [31:0] ss_sys_rd_data;
+wire        ss_ba_quiet;
+
+wire        ss_sel_eeprom;
+wire  [9:0] ss_cart_addr;
+wire        ss_cart_wr_en;
+wire [31:0] ss_cart_rd_data;
+
+wire        s32x_aden;
+
+wire        ss_32x_parked;
+wire        ss_32x_quiet;
+wire        ss_sel_32x;
+wire [15:0] ss_32x_addr;
+wire [31:0] ss_32x_rd_data;
+
+wire        ss_park_engage;   // the clock the 68000, Z80, 32X and SVP all park on
+wire        s32x_can_park;
+
+reg         ss_ssm_req = 0;
+reg         ss_ssm_we;
+reg         ss_ssm_cache = 0;
+reg  [17:2] ss_ssm_addr;
+reg  [31:0] ss_ssm_din;
+wire [31:0] ss_ssm_dout;
+wire        ss_ssm_ack;
+wire        ss_fb_own;
+wire [15:0] ss_fb_addr;
+wire        ss_fb_we;
+
+wire        ss_sel_svp;
+wire [10:0] ss_svp_addr;
+wire [31:0] ss_svp_rd;
+wire        ss_svp_parked;
+wire        svp_can_park;
+
+reg         ss_ddr_req = 0;
+reg         ss_ddr_we;
+reg  [28:0] ss_ddr_addr;
+reg  [63:0] ss_ddr_din;
+wire [63:0] ss_ddr_dout;
+wire        ss_ddr_ack;
+
+reg         ss_sdr_own = 0;
+wire [14:0] ss_sram_addr;
+wire        ss_sel_crom;
+wire [19:0] ss_crom_addr;
+reg         ss_sdr_hi = 0;
+reg         ss_sdr_rd = 0, ss_sdr_wr = 0;
+reg  [25:1] ss_sdr_a;
+reg  [15:0] ss_sdr_d;
+
+wire  [9:0] ss_rfs_cur;
+reg   [9:0] ss_rfs_park = 0;
+
 hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 (
 	.clk_sys(clk_sys),
@@ -217,9 +357,13 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.new_vmode(new_vmode),
 
 	.status(status),
-	.status_in({status[63:8],region_req,status[5:0]}),
-	.status_set(region_set),
+	.status_in({status[127:66],ssui_slot,status[63:8],(region_set ? region_req : status[7:6]),status[5:0]}),
+	.status_set(region_set | ssui_status_upd),
 	.status_menumask({en216p,!gun_mode,1'b1,status[9],~gg_available,~bk_ena}),
+
+	// On-screen "Save 1" / "Load 1" text, driven by savestate_ui.
+	.info_req(ss_info_req),
+	.info(ss_info),
 
 	.ioctl_download(ioctl_download),
 	.ioctl_index(ioctl_index),
@@ -379,6 +523,9 @@ end
 
 
 
+// Every cartridge, 32X or Mega Drive, runs through the 32X adapter.
+wire s32x_rom = 1'b1;
+
 //Genesis
 wire [23:1] GEN_VA;
 wire [15:0] GEN_VDI, GEN_VDO;
@@ -463,8 +610,8 @@ gen gen
 	.RESOLUTION(resolution),
 
 	.J3BUT(~status[5]),
-	.JOY_1(status[4] ? joystick_1 : joystick_0),
-	.JOY_2(status[4] ? joystick_0 : joystick_1),
+	.JOY_1(status[4] ? joystick_1 : joystick_0[11:0]),
+	.JOY_2(status[4] ? joystick_0[11:0] : joystick_1),
 	.JOY_3(joystick_2),
 	.JOY_4(joystick_3),
 	.JOY_5(joystick_4),
@@ -514,7 +661,70 @@ gen gen
 	.BGB_EN(VDP_BGB_EN),
 	.SPR_EN(VDP_SPR_EN),
 	.BG_GRID_EN(VDP_BG_GRID_EN),
-	.SPR_GRID_EN(VDP_SPR_GRID_EN)
+	.SPR_GRID_EN(VDP_SPR_GRID_EN),
+
+	.SS_FREEZE(ss_cpu_freeze),
+	.SS_RELEASE(ss_release_d),
+	.SS_EXT_CAN(svp_can_park & s32x_can_park),
+	.SS_ENGAGE(ss_park_engage),
+	.SS_DIV_OK(ss_div_ok),
+	.SS_M68K_FROZEN(ss_m68k_frozen),
+	.SS_M68K_ADDR(ss_m68k_addr),
+	.SS_M68K_WR_DATA(ss_state_dout[15:0]),
+	.SS_M68K_WR_EN(ss_m68k_wr_en),
+	.SS_M68K_RD_DATA(ss_m68k_rd_data),
+
+	.SS_ACTIVE(ss_freeze_active),
+	.SS_MEM_SEL(ss_gen_mem_sel),
+	.SS_MEM_ADDR(ss_gen_mem_addr),
+	.SS_MEM_WR_DATA(ss_state_dout[15:0]),
+	.SS_MEM_WR_EN(ss_gen_mem_wr_en),
+	.SS_MEM_RD_DATA(ss_gen_mem_rd_data),
+
+	.SS_VDP_SEL(ss_vdp_sel),
+	.SS_VDP_ADDR(ss_vdp_addr),
+	.SS_VDP_WR_DATA(ss_state_dout),
+	.SS_VDP_WR_EN(ss_vdp_wr_en),
+	.SS_VDP_RD_DATA(ss_vdp_rd_data),
+	.SS_VDP_QUIET(ss_vdp_quiet),
+	// The VDP latches its park position on the park clock P (ss_park_engage).
+	.SS_VDP_PARK(ss_m68k_frozen | ss_park_engage | ss_freeze_active),
+	.SS_VDP_RESUME(ss_vdp_resume),
+	.SS_VDP_PHASE_OK(ss_vdp_phase_ok),
+
+	.SS_FM_ADDR(ss_fm_addr),
+	.SS_FM_WR_DATA(ss_state_dout),
+	.SS_FM_WR_EN(ss_fm_wr_en),
+	.SS_FM_RD_EN(ss_fm_rd_en),
+	.SS_FM_RD_DATA(ss_fm_rd_data),
+	.SS_FM_READY(ss_fm_ready),
+	.SS_FM_REPLAY(ss_load_done),
+	.SS_FM_REPLAYING(),
+
+	.SS_Z80_FROZEN(ss_z80_frozen),
+	.SS_Z80_REG(ss_z80_reg),
+	.SS_Z80_DIR(ss_z80_dir),
+	.SS_Z80_DIRSET(ss_z80_dirset),
+	.SS_Z80_HALT(ss_z80_halt),
+	.SS_Z80_HALT_DIR(ss_z80_halt_dir),
+	.SS_Z80_SEQ(ss_z80_seq),
+	.SS_Z80_SEQ_DIR(ss_z80_seq_dir),
+	.SS_Z80_BAR(ss_z80_bar),
+	.SS_Z80_BAR_DIR(ss_z80_bar_dir),
+	.SS_Z80_CTRL(ss_z80_ctrl),
+	.SS_Z80_CTRL_DIR(ss_z80_ctrl_dir),
+	.SS_Z80_EXT_SET(ss_z80_ext_set),
+
+	.SS_PSG_ADDR(ss_psg_addr),
+	.SS_PSG_WR_DATA(ss_state_dout),
+	.SS_PSG_WR_EN(ss_psg_wr_en),
+	.SS_PSG_RD_DATA(ss_psg_rd_data),
+
+	.SS_SYS_ADDR(ss_sys_addr),
+	.SS_SYS_WR_DATA(ss_state_dout),
+	.SS_SYS_WR_EN(ss_sys_wr_en),
+	.SS_SYS_RD_DATA(ss_sys_rd_data),
+	.SS_BA_QUIET(ss_ba_quiet)
 );
 
 // The SVP DRAM sits in the RAS2 area, which otherwise answers at once: its accesses wait
@@ -641,7 +851,26 @@ S32X #(
 	.HBL(S32X_HBLANK),
 
 	.PWM_L(S32X_SL),
-	.PWM_R(S32X_SR)
+	.PWM_R(S32X_SR),
+
+	.ADEN(s32x_aden),
+
+	// The 32X parks on the clock the 68000 does (see the savestate section). It is held
+	// from P (where it skips its burst) and runs again on the release clock, a VCLK at
+	// the phase of P, while gen resumes one clock later.
+	.SS_PHASE_HOLD(ss_park_engage | (ss_m68k_frozen & ~ss_release_now & ~ss_release_d)),
+	.SS_PARK_REQ(ss_m68k_frozen),
+	.SS_PARK_ENGAGE(ss_park_engage),
+	.SS_CAN_PARK(s32x_can_park),
+	.SS_RELEASE(ss_release_now),
+	.SS_PARKED(ss_32x_parked),
+	.SS_QUIET(ss_32x_quiet),
+	.SS_ACTIVE(ss_freeze_active),
+	.SS_SEL(ss_freeze_active & ss_sel_32x),
+	.SS_ADDR(ss_32x_addr),
+	.SS_WR_EN(ss_state_we & ss_sel_32x),
+	.SS_WR_DATA(ss_state_dout),
+	.SS_RD_DATA(ss_32x_rd_data)
 );
 assign S32X_CDI = CART_VDO;
 assign S32X_ROM_WAIT = CART_SRAM_RD || CART_SRAM_WR ? sdr_busy[2] : sdr_busy[1];
@@ -664,6 +893,7 @@ wire  [7:0] CART_SRAM_DO;
 wire        CART_SRAM_WR;
 wire        CART_SRAM_RD;
 wire        CART_EP_RD, CART_EP_WR;
+wire        CART_ROM_BANK_HI;
 CART cart
 (
 	.CLK(clk_sys),
@@ -704,7 +934,15 @@ CART cart
 	.noram_quirk(noram_quirk | svp_quirk), // the SVP DRAM is where SRAM would be
 	.pier_quirk(pier_quirk),
 	.realtec_map(realtec_map),
-	.sf_map(sf_map)
+	.sf_map(sf_map),
+	.ROM_BANK_HI(CART_ROM_BANK_HI),
+
+	.SS_ACTIVE(ss_freeze_active),
+	.SS_SEL(ss_sel_eeprom),
+	.SS_ADDR(ss_cart_addr),
+	.SS_WR_DATA(ss_state_dout),
+	.SS_WR_EN(ss_cart_wr_en),
+	.SS_RD_DATA(ss_cart_rd_data)
 );
 assign CART_ROM_DI = sdr_do[1];
 assign CART_SRAM_DI = sdr_do[2][7:0];
@@ -713,8 +951,9 @@ assign CART_SRAM_DI = sdr_do[2][7:0];
 // registers at A15000-A1500F, DRAM at 300000-37FFFF and its two cell-arranged views at
 // 390000 and 3A0000. With a Mega Drive cartridge the 32X passes that bus through
 // unchanged, so the SVP takes it straight from gen, off the SH-2 paths. Its 128KB DRAM is
-// framebuffer 1, which a Mega Drive cartridge leaves to no one. Its program reads take
-// SDRAM channel 0, which the 32X SDRAM (in DDR3) leaves free.
+// framebuffer 1, which a Mega Drive cartridge leaves to no one, so the framebuffer region
+// of the savestate carries it. Its program reads take SDRAM channel 0, which the 32X
+// SDRAM (in DDR3) leaves free.
 wire svp_reg_area  = svp_quirk && GEN_VA[23:4] == 20'hA1500;
 wire svp_dram_area = svp_quirk && (GEN_VA[23:19] == 5'b00110 || GEN_VA[23:16] == 8'h39 || GEN_VA[23:16] == 8'h3A);
 
@@ -726,21 +965,29 @@ wire [15:0] SVP_DRAM_A;
 wire [15:0] SVP_DRAM_DO;
 wire        SVP_DRAM_WE;
 
+// The DSP stops with the 68000 at its park and runs again with it (ss_release_d). Its
+// memory controller is not under the clock enable, so the park waits for a clock where
+// it has nothing in flight (SS_PARKED, program read handshake and SDRAM channel at rest)
+// and the DSP takes no enable: then nothing in the SVP moves while it is held, and it
+// resumes exactly where the 68000 does. The enable phase is kept across the stop and in
+// the savestate (word 3FF of the SVP block).
 // The enable is low while the SVP is in reset, so the first clock after it never enables
 // the DSP (as SVP_CLKEN in the Genesis core). On that clock the program fetch of 400h
 // starts; an enable there would execute the empty instruction register and advance PC,
 // leaving the fetches one word behind PC: the boot code then misses its wait for the
 // 68000 and Virtua Racing stops at "Communication Error" with a black screen.
+wire svp_hold = ss_m68k_frozen & ~ss_release_d;
 reg  svp_ce_ph = 0;
 always @(posedge clk_sys) begin
 	if(!svp_quirk || reset || rom_download) svp_ce_ph <= 0;
-	else svp_ce_ph <= ~svp_ce_ph;
+	else if(!svp_hold) svp_ce_ph <= ~svp_ce_ph;
+	if(ss_state_we && ss_sel_svp && ss_svp_addr == 11'h3FF) svp_ce_ph <= ss_state_dout[0];
 end
 
 SVP svp
 (
 	.CLK(clk_sys),
-	.CE(svp_ce_ph),
+	.CE(svp_ce_ph & ~svp_hold),
 	.RST_N(~(reset | rom_download) & svp_quirk),
 	.ENABLE(1'b1),
 
@@ -760,7 +1007,14 @@ SVP svp
 	.DRAM_A(SVP_DRAM_A),
 	.DRAM_DI(S32X_FB1_DI),
 	.DRAM_DO(SVP_DRAM_DO),
-	.DRAM_WE(SVP_DRAM_WE)
+	.DRAM_WE(SVP_DRAM_WE),
+
+	.SS_ADDR(ss_svp_addr),
+	.SS_RD_DATA(ss_svp_rd),
+	.SS_WR_DATA(ss_state_dout),
+	.SS_WR_EN(ss_state_we & ss_sel_svp),
+	.SS_ACTIVE(ss_freeze_active),
+	.SS_PARKED(ss_svp_parked)
 );
 
 // Program reads: one SDRAM read per toggle of ROM_REQ; ROM_ACK toggles back with the data.
@@ -793,6 +1047,11 @@ always @(posedge clk_sys) begin
 	endcase
 end
 
+// See svp_hold: the 68000 parks only on a clock where the SVP can stop with nothing in
+// flight.
+assign svp_can_park = ~svp_quirk | (ss_svp_parked & ~svp_ce_ph & ~svp_rom_rd & ~sdr_busy[0] &
+                                    svp_rom_st == 2'd0 & SVP_ROM_REQ == svp_rom_ack);
+
 always @(posedge clk_sys) begin
 	reg old_busy;
 	
@@ -815,7 +1074,23 @@ ddram ddram
 	.ramh_din(S32X_SDR_DO),
 	.ramh_rd(S32X_SDR_CS & S32X_SDR_RD),
 	.ramh_wr({2{S32X_SDR_CS}} & S32X_SDR_WE),
-	.ramh_busy(ddr_busy)
+	.ramh_busy(ddr_busy),
+
+	.ss_req(ss_ddr_req),
+	.ss_we(ss_ddr_we),
+	.ss_addr(ss_ddr_addr),
+	.ss_din(ss_ddr_din),
+	.ss_dout(ss_ddr_dout),
+	.ss_ack(ss_ddr_ack),
+
+	// 32X SDRAM region of the savestate, straight to DDR3 (keeps the SH-2 port as is).
+	.ssm_req(ss_ssm_req),
+	.ssm_we(ss_ssm_we),
+	.ssm_cache(ss_ssm_cache),
+	.ssm_addr(ss_ssm_addr),
+	.ssm_din(ss_ssm_din),
+	.ssm_dout(ss_ssm_dout),
+	.ssm_ack(ss_ssm_ack)
 );
 assign S32X_SDR_DI   = ddr_do;
 assign S32X_SDR_WAIT = ddr_busy;
@@ -852,14 +1127,41 @@ sdram sdram
 	.wr2({2{CART_SRAM_WR | CART_EP_WR}}),
 	.busy2(sdr_busy[2]),
 	
-	//ROM/BRAM Load/Save
-	.addr3(rom_download ? {1'b0,ioctl_addr[24:1]} : {10'b1100000000,sd_lba[6:0],tmpram_addr}),
-	.din3(rom_download ? {ioctl_data[7:0],ioctl_data[15:8]} : {tmpram_dout[7:0],tmpram_dout[15:8]}),
+	//ROM/BRAM Load/Save. The savestate streams the cart SRAM, or the writable cart ROM of
+	//a Sega Channel cartridge, two halfwords per state word.
+	.addr3(ss_sdr_own ? ss_sdr_a : rom_download ? {1'b0,ioctl_addr[24:1]} : {10'b1100000000,sd_lba[6:0],tmpram_addr}),
+	.din3(ss_sdr_own ? ss_sdr_d : rom_download ? {ioctl_data[7:0],ioctl_data[15:8]} : {tmpram_dout[7:0],tmpram_dout[15:8]}),
 	.dout3(sdr_do[3]),
-	.rd3(rom_download ? 1'b0 : (tmpram_req & ~bk_loading)),
-	.wr3(rom_download ? {2{ioctl_wait}} : {2{tmpram_req & bk_loading}}),
-	.busy3(sdr_busy[3])
+	.rd3(ss_sdr_own ? ss_sdr_rd : rom_download ? 1'b0 : (tmpram_req & ~bk_loading)),
+	.wr3(ss_sdr_own ? {2{ss_sdr_wr}} : rom_download ? {2{ioctl_wait}} : {2{tmpram_req & bk_loading}}),
+	.busy3(sdr_busy[3]),
+
+	.ss_rfs_cur(ss_rfs_cur),
+	.ss_rfs_set(ss_release_d),
+	.ss_rfs_val(ss_rfs_park ? ss_rfs_park - 1'd1 : 10'd0)
 );
+
+// The SDRAM refresh timer one clock after the park clock P, kept with the raster and
+// divider phases (SYS word 6, bits 13-4). The release of gen, one clock after the
+// release clock, loads it back, one count on for the clk_ram edge that latched it, so a
+// resumed CPU meets the same refresh stalls.
+reg        ss_m68k_frozen_d = 0;
+always @(posedge clk_sys) begin
+	ss_m68k_frozen_d <= ss_m68k_frozen;
+	if(ss_m68k_frozen & ~ss_m68k_frozen_d) ss_rfs_park <= ss_rfs_cur;
+	if(ss_sys_wr_en && ss_sys_addr == 3'd6) ss_rfs_park <= ss_state_dout[13:4];
+end
+
+// The framebuffers are one savestate region: word N is {FB1[N], FB0[N]}. The stream
+// takes the ports only while everything is parked; scanout then shows garbage for the
+// frames of the stream, which the next frames redraw. With an SVP cartridge FB1 is the
+// SVP DRAM.
+wire [15:0] fb0_a  = ss_fb_own ? ss_fb_addr : S32X_FB0_A;
+wire [15:0] fb1_a  = ss_fb_own ? ss_fb_addr : svp_quirk ? SVP_DRAM_A : S32X_FB1_A;
+wire [15:0] fb0_d  = ss_fb_own ? ss_state_dout[15:0]  : S32X_FB0_DO;
+wire [15:0] fb1_d  = ss_fb_own ? ss_state_dout[31:16] : svp_quirk ? SVP_DRAM_DO : S32X_FB1_DO;
+wire  [1:0] fb0_we = ss_fb_own ? {2{ss_fb_we}} : S32X_FB0_WE;
+wire  [1:0] fb1_we = ss_fb_own ? {2{ss_fb_we}} : svp_quirk ? {2{SVP_DRAM_WE}} : S32X_FB1_WE;
 
 `ifdef MISTER_DUAL_SDRAM
 wire sdr2_busy;
@@ -911,27 +1213,22 @@ sdram2 sdram2
 spram #(16,8) vdp_fb0_l
 (
 	.clock(clk_sys),
-	.address(S32X_FB0_A),
-	.data(S32X_FB0_DO[7:0]),
-	.wren(S32X_FB0_WE[0]),
+	.address(fb0_a),
+	.data(fb0_d[7:0]),
+	.wren(fb0_we[0]),
 	.q(S32X_FB0_DI[7:0])
 );
 
 spram #(16,8) vdp_fb0_u
 (
 	.clock(clk_sys),
-	.address(S32X_FB0_A),
-	.data(S32X_FB0_DO[15:8]),
-	.wren(S32X_FB0_WE[1]),
+	.address(fb0_a),
+	.data(fb0_d[15:8]),
+	.wren(fb0_we[1]),
 	.q(S32X_FB0_DI[15:8])
 );
 
 `endif
-
-// With an SVP cartridge FB1 is the SVP DRAM.
-wire [15:0] fb1_a  = svp_quirk ? SVP_DRAM_A : S32X_FB1_A;
-wire [15:0] fb1_d  = svp_quirk ? SVP_DRAM_DO : S32X_FB1_DO;
-wire  [1:0] fb1_we = svp_quirk ? {2{SVP_DRAM_WE}} : S32X_FB1_WE;
 
 spram #(16,8) vdp_fb1_l
 (
@@ -1078,7 +1375,7 @@ lightgun lightgun
 
 	.JOY_X(gun_mode[0] ? joy0_x : joy1_x),
 	.JOY_Y(gun_mode[0] ? joy0_y : joy1_y),
-	.JOY(gun_mode[0] ? joystick_0 : joystick_1),
+	.JOY(gun_mode[0] ? joystick_0[11:0] : joystick_1),
 
 	.RELOAD(gun_type),
 
@@ -1110,17 +1407,10 @@ reg        region_set = 0;
 
 wire       pressed = ps2_key[9];
 wire [8:0] code    = ps2_key[8:0];
+// F1 to F4 are savestate keys (savestate_ui). The region is set in the OSD or taken
+// from the ROM header.
 always @(posedge clk_sys) begin
-	reg old_state, old_ready = 0;
-	old_state <= ps2_key[10];
-
-	if(old_state != ps2_key[10]) begin
-		casex(code)
-			'h005: begin region_req <= 0; region_set <= pressed; end // F1
-			'h006: begin region_req <= 1; region_set <= pressed; end // F2
-			'h004: begin region_req <= 2; region_set <= pressed; end // F3
-		endcase
-	end
+	reg old_ready = 0;
 
 	old_ready <= cart_hdr_ready;
 	if(~status[9] & ~old_ready & cart_hdr_ready) begin
@@ -1160,14 +1450,12 @@ always @(posedge clk_sys) begin
 end
 
 reg [25:0] rom_sz;
-reg s32x_rom = 0;
 always @(posedge clk_sys) begin
 	reg old_download;
 	old_download <= rom_download;
 
 	if(~old_download && rom_download) begin
 		{hdr_j,hdr_u,hdr_e} <= 0;
-		s32x_rom <= 1; //&ioctl_index[7:6];
 	end
 	
 	if(old_download && ~rom_download) begin
@@ -1349,7 +1637,7 @@ always @(posedge clk_sys) begin
 		sd_lba <= 0;
 //		bk_reload <= 0;
 		bk_loading <= 0;
-		if (bk_ena & ((~old_load & bk_load) | (~old_save & bk_save) | (~old_save_a & bk_save_a & sav_pending))) begin
+		if (bk_ena & ~ss_busy & ((~old_load & bk_load) | (~old_save & bk_save) | (~old_save_a & bk_save_a & sav_pending))) begin
 			bk_state <= 1;
 			bk_loading <= bk_load;
 //			bk_reload <= bk_load;
@@ -1503,7 +1791,7 @@ always @(posedge clk_sys) begin
 
 	if((ps2_key[10] != old_state) && pressed) begin
 		casex(code)
-			'h00C: begin VDP_32X_EN <= ~VDP_32X_EN; end 	// F4
+			// F4 is a savestate key.
 			'h003: begin VDP_MD_EN <= ~VDP_MD_EN; end 	// F5
 			'h00B: begin VDP_BGA_EN <= ~VDP_BGA_EN; end 	// F6
 			'h083: begin VDP_BGB_EN <= ~VDP_BGB_EN; end 	// F7
@@ -1519,5 +1807,538 @@ always @(posedge clk_sys) begin
 		endcase
 	end
 end
+
+//////////////////////////////  Savestates  ////////////////////////////////////
+// The Mega Drive side and the 32X side (two SH-2, adapter, 32X VDP, palette, 32X SDRAM
+// and framebuffers). Mega Drive games carry the idle 32X side too.
+// Changing a region offset or size requires an SS_VERSION bump.
+
+localparam [31:0] SS_MAGIC   = 32'h33325353;  // "32SS"
+localparam [31:0] SS_VERSION = 32'h00000005;
+
+// Region sizes are in 32-bit words: one native byte or 16-bit value per word.
+localparam [31:0] SS_HEADER_SIZE    = 32'd2;
+localparam [31:0] SS_WORK_RAM_SIZE  = 32'd32768;  // 64KB work RAM as 32K x 16-bit
+localparam [31:0] SS_VRAM_SIZE      = 32'd65536;  // 64KB VRAM, 1 byte/word
+localparam [31:0] SS_ZRAM_SIZE      = 32'd8192;   // 8KB Z80 RAM, 1 byte/word
+localparam [31:0] SS_SRAM_SIZE      = 32'd32768;  // cart SRAM window, one SDRAM word/word
+localparam [31:0] SS_EEPROM_SIZE    = 32'd1024;   // cart EEPROM, 1 byte/word
+localparam [31:0] SS_CRAM_SIZE      = 32'd64;     // VDP SS_SEL 0
+localparam [31:0] SS_VSRAM_SIZE     = 32'd64;     // VDP SS_SEL 1
+localparam [31:0] SS_OBJ_SIZE       = 32'd128;    // VDP SS_SEL 2, sprite attribute cache (7-bit index)
+localparam [31:0] SS_VDP_REGS_SIZE  = 32'd32;     // VDP SS_SEL 3, see the layout in vdp.sv
+localparam [31:0] SS_M68K_REGS_SIZE = 32'd128;    // fx68k
+localparam [31:0] SS_Z80_REGS_SIZE  = 32'd32;
+localparam [31:0] SS_FM_SHADOW_SIZE = 32'd512;    // YM2612 shadow and chip state
+localparam [31:0] SS_PSG_REGS_SIZE  = 32'd16;
+localparam [31:0] SS_SYS_REGS_SIZE  = 32'd8;      // I/O registers, bus arbiter
+localparam [31:0] SS_CART_REGS_SIZE = 32'd8;      // mapper registers, EEPROM interface
+localparam [31:0] SS_MISC_SIZE      = 32'd32;
+localparam [31:0] SS_32X_SIZE       = S32X_PKG::SS_32X_SIZE; // SH-2s, adapter, 32X VDP, palette
+localparam [31:0] SS_SDR32_SIZE     = 32'd65536;  // 256KB 32X SDRAM, two 16-bit words/word
+localparam [31:0] SS_FB_SIZE        = 32'd65536;  // framebuffers, {FB1, FB0} per word; FB1 is the SVP DRAM
+localparam [31:0] SS_SVP_SIZE       = 32'd2048;   // SVP: DSP, RAMA/RAMB, interface, IRAM (rtl/SVP/SVP.vhd)
+// Sega Channel only: the 4MB the cartridge can write (cart ROM below 4MB, two halfwords
+// per word). The image of any other cartridge ends before it.
+localparam [31:0] SS_CROM_SIZE      = 32'd1048576;
+
+localparam [31:0] SS_OFF_WORK_RAM  = SS_HEADER_SIZE;
+localparam [31:0] SS_OFF_VRAM      = SS_OFF_WORK_RAM  + SS_WORK_RAM_SIZE;
+localparam [31:0] SS_OFF_ZRAM      = SS_OFF_VRAM      + SS_VRAM_SIZE;
+localparam [31:0] SS_OFF_SRAM      = SS_OFF_ZRAM      + SS_ZRAM_SIZE;
+localparam [31:0] SS_OFF_EEPROM    = SS_OFF_SRAM      + SS_SRAM_SIZE;
+localparam [31:0] SS_OFF_CRAM      = SS_OFF_EEPROM    + SS_EEPROM_SIZE;
+localparam [31:0] SS_OFF_VSRAM     = SS_OFF_CRAM      + SS_CRAM_SIZE;
+localparam [31:0] SS_OFF_OBJ       = SS_OFF_VSRAM     + SS_VSRAM_SIZE;
+localparam [31:0] SS_OFF_VDP_REGS  = SS_OFF_OBJ       + SS_OBJ_SIZE;
+localparam [31:0] SS_OFF_M68K_REGS = SS_OFF_VDP_REGS  + SS_VDP_REGS_SIZE;
+localparam [31:0] SS_OFF_Z80_REGS  = SS_OFF_M68K_REGS + SS_M68K_REGS_SIZE;
+localparam [31:0] SS_OFF_FM_SHADOW = SS_OFF_Z80_REGS  + SS_Z80_REGS_SIZE;
+localparam [31:0] SS_OFF_PSG_REGS  = SS_OFF_FM_SHADOW + SS_FM_SHADOW_SIZE;
+localparam [31:0] SS_OFF_SYS_REGS  = SS_OFF_PSG_REGS  + SS_PSG_REGS_SIZE;
+localparam [31:0] SS_OFF_CART_REGS = SS_OFF_SYS_REGS  + SS_SYS_REGS_SIZE;
+localparam [31:0] SS_OFF_MISC      = SS_OFF_CART_REGS + SS_CART_REGS_SIZE;
+localparam [31:0] SS_OFF_32X       = SS_OFF_MISC      + SS_MISC_SIZE;
+localparam [31:0] SS_OFF_SDR32     = SS_OFF_32X       + SS_32X_SIZE;
+localparam [31:0] SS_OFF_FB        = SS_OFF_SDR32     + SS_SDR32_SIZE;
+localparam [31:0] SS_OFF_SVP       = SS_OFF_FB        + SS_FB_SIZE;
+localparam [31:0] SS_OFF_CROM      = SS_OFF_SVP       + SS_SVP_SIZE;
+
+localparam [31:0] SS_FULL_SIZE     = SS_OFF_CROM;
+localparam [31:0] SS_CROM_FULL     = SS_OFF_CROM      + SS_CROM_SIZE;
+wire       [31:0] ss_state_size    = schan_quirk ? SS_CROM_FULL : SS_FULL_SIZE;
+
+wire        ss_save_done;
+wire        ss_freeze_req;
+wire [31:0] ss_state_addr;
+wire        ss_state_wr, ss_state_rd, ss_state_we;
+
+// savestate_ui. F1 to F4 load slots 1 to 4 and Alt with F1 to F4 saves.
+// On a gamepad, hold the Savestate button, J1 bit 12, which is unmapped by default.
+// With it held, Left and Right select the slot, Mode+Down saves and Mode+Up loads.
+// A Sega Channel cartridge whose bank registers have mapped a page at 4MB or above can have
+// written memory the image does not hold: its savestates stay off until the next reset.
+wire ssui_save, ssui_load;
+wire ssui_allow = ~rom_download & ~ss_busy & ~bk_state & ~(schan_quirk & CART_ROM_BANK_HI);
+
+savestate_ui #(.INFO_TIMEOUT_BITS(25)) savestate_ui
+(
+	.clk          (clk_sys),
+	.ps2_key      (ps2_key),
+	.allow_ss     (ssui_allow),
+	.joySS        (joystick_0[12]),
+	.joyRight     (joystick_0[0]),
+	.joyLeft      (joystick_0[1]),
+	.joyDown      (joystick_0[2]),
+	.joyUp        (joystick_0[3]),
+	.joyStart     (joystick_0[8]),   // Mode, because Start pauses most games.
+	.status_slot  (status[65:64]),
+	.OSD_saveload ({status[67], status[66]}),  // Bit 1 loads, bit 0 saves.
+	.ss_save      (ssui_save),
+	.ss_load      (ssui_load),
+	.ss_info_req  (ss_info_req),
+	.ss_info      (ss_info),
+	.statusUpdate (ssui_status_upd),
+	.selected_slot(ssui_slot)
+);
+
+// savestate_ui emits 1-cycle pulses and the engine samples through a 2-FF
+// synchronizer, so stretch them.
+reg [7:0] ss_save_cnt = 0;
+reg [7:0] ss_load_cnt = 0;
+reg [1:0] ss_slot_reg = 0;
+always @(posedge clk_sys) begin
+	if(ssui_save) begin ss_save_cnt <= 8'd100; ss_slot_reg <= ssui_slot; end
+	else if(ss_save_cnt) ss_save_cnt <= ss_save_cnt - 1'd1;
+
+	if(ssui_load) begin ss_load_cnt <= 8'd100; ss_slot_reg <= ssui_slot; end
+	else if(ss_load_cnt) ss_load_cnt <= ss_load_cnt - 1'd1;
+end
+wire ss_save_req = |ss_save_cnt;
+wire ss_load_req = |ss_load_cnt;
+
+// Grant capture only after a VBlank, with parked CPUs and an idle bus.
+reg ss_vbl_parked = 0;
+always @(posedge clk_sys) begin
+	if(!ss_freeze_req) ss_vbl_parked <= 0;
+	else if(vblank)    ss_vbl_parked <= 1;
+end
+
+// Cart ROM and SRAM requests finish once the 68000 and the SH-2s have parked with the
+// bus idle (the SH-2s read the cartridge through the same SDRAM channel), and the SVP
+// program reads once the SVP has parked.
+wire ss_sdr_quiet = ~sdr_busy[0] & ~sdr_busy[1] & ~sdr_busy[2];
+
+// The 32X parks on the clock the 68000 does (ss_park_engage, rtl/GEN/gen.sv): a VCLK
+// where both SH-2 are between bus cycles at the end of a clock burst; it skips that
+// burst and takes no VCLK until the release (rtl/32X/32X.sv). Its SDRAM requests (DDR3)
+// have finished once ddr_busy is low. The SVP stops on the same clock and is parked
+// once its memory controller has drained (SS_PARKED).
+wire ss_freeze_ack = ss_vbl_parked & ss_m68k_frozen & ss_z80_frozen &
+                     ss_vdp_quiet & ss_ba_quiet & ss_sdr_quiet &
+                     ss_32x_parked & ss_32x_quiet & ~ddr_busy &
+                     (~svp_quirk | ss_svp_parked);
+
+// An image is only taken, or written back, with everything parked. If the CPUs never
+// meet a common safe point, the engine times out after about three seconds and the
+// request is dropped; the CPUs keep running until they park.
+// Latch the grant so the port muxes do not switch during the stream.
+always @(posedge clk_sys) begin
+	if (!ss_freeze_req)      ss_freeze_active <= 0;
+	else if (ss_freeze_ack)  ss_freeze_active <= 1;
+end
+
+// The raster keeps running. Hold the CPUs until the live raster and the 68000 clock
+// divider are both back at their phase of the park clock P. On that clock (release
+// clock) the 32X starts the SH-2 burst it skipped at P; gen and the SVP had already run
+// P, so they resume one clock later (ss_release_d) on the same pulses they would have
+// had. The VDP then restores its pending interrupts and HINT countdown (SS_RESUME_LAG
+// = 1). The divider repeats every 7 clocks and a frame is not a multiple of it, so this
+// can take up to 7 frames. A mode change that makes the phase unreachable is bounded by
+// 2^24 clocks (~310 ms).
+reg        ss_resume_hold = 0;
+reg [23:0] ss_resume_to   = 0;
+assign ss_release_now = ss_resume_hold & ss_vdp_phase_ok & ss_div_ok;
+wire ss_rel_cond = ss_release_now | (&ss_resume_to);
+always @(posedge clk_sys) begin
+	ss_release_d  <= ss_release_now;
+	ss_vdp_resume <= 0;
+	if (ss_freeze_active & ~ss_freeze_req) begin
+		ss_resume_hold <= 1;
+		ss_resume_to   <= 0;
+	end
+	else if (ss_freeze_req) begin
+		ss_resume_hold <= 0;
+	end
+	else if (ss_resume_hold) begin
+		ss_resume_to <= ss_resume_to + 1'd1;
+		if (ss_rel_cond) begin
+			ss_resume_hold <= 0;
+			ss_vdp_resume  <= 1;
+		end
+	end
+end
+// (freeze_active & ~freeze_req) covers the one clock between the request
+// dropping and the hold being registered, so the CPUs never see a gap.
+wire ss_hold_any  = (ss_freeze_active & ~ss_freeze_req) | ss_resume_hold;
+assign ss_cpu_freeze = ss_freeze_req | ss_hold_any;
+
+
+// Region decode.
+`define SS_IN(off, size) ((ss_state_addr >= (off)) && (ss_state_addr < (off) + (size)))
+
+wire ss_sel_work_ram = `SS_IN(SS_OFF_WORK_RAM,  SS_WORK_RAM_SIZE);
+wire ss_sel_vram     = `SS_IN(SS_OFF_VRAM,      SS_VRAM_SIZE);
+wire ss_sel_zram     = `SS_IN(SS_OFF_ZRAM,      SS_ZRAM_SIZE);
+wire ss_sel_sram     = `SS_IN(SS_OFF_SRAM,      SS_SRAM_SIZE);
+assign ss_sel_eeprom = `SS_IN(SS_OFF_EEPROM,    SS_EEPROM_SIZE);
+wire ss_sel_cram     = `SS_IN(SS_OFF_CRAM,      SS_CRAM_SIZE);
+wire ss_sel_vsram    = `SS_IN(SS_OFF_VSRAM,     SS_VSRAM_SIZE);
+wire ss_sel_obj      = `SS_IN(SS_OFF_OBJ,       SS_OBJ_SIZE);
+wire ss_sel_vdp_regs = `SS_IN(SS_OFF_VDP_REGS,  SS_VDP_REGS_SIZE);
+wire ss_sel_m68k     = `SS_IN(SS_OFF_M68K_REGS, SS_M68K_REGS_SIZE);
+wire ss_sel_z80      = `SS_IN(SS_OFF_Z80_REGS,  SS_Z80_REGS_SIZE);
+wire ss_sel_fm       = `SS_IN(SS_OFF_FM_SHADOW, SS_FM_SHADOW_SIZE);
+wire ss_sel_psg      = `SS_IN(SS_OFF_PSG_REGS,  SS_PSG_REGS_SIZE);
+wire ss_sel_sys      = `SS_IN(SS_OFF_SYS_REGS,  SS_SYS_REGS_SIZE);
+wire ss_sel_cart     = `SS_IN(SS_OFF_CART_REGS, SS_CART_REGS_SIZE);
+assign ss_sel_32x     = `SS_IN(SS_OFF_32X,       SS_32X_SIZE);
+wire ss_sel_sdr32    = `SS_IN(SS_OFF_SDR32,     SS_SDR32_SIZE);
+wire ss_sel_fb       = `SS_IN(SS_OFF_FB,        SS_FB_SIZE);
+assign ss_sel_svp    = `SS_IN(SS_OFF_SVP,       SS_SVP_SIZE);
+assign ss_sel_crom   = schan_quirk && `SS_IN(SS_OFF_CROM, SS_CROM_SIZE);
+assign ss_svp_addr   = 11'(ss_state_addr - SS_OFF_SVP);
+
+// 32X internals (rtl/32X/32X.sv). The framebuffers take their block RAM ports, written
+// twice with the same word during the two-clock state_we.
+assign ss_32x_addr = 16'(ss_state_addr - SS_OFF_32X);
+// The read cache words of the adapter block belong to ddram.sv (SDRAM channel below).
+wire ss_sel_rc     = ss_sel_32x && ss_32x_addr >= 16'(S32X_PKG::SS_OFF_RC) &&
+                     ss_32x_addr < 16'(S32X_PKG::SS_OFF_RC + S32X_PKG::SS_RC_SIZE);
+assign ss_fb_own   = ss_freeze_active & ss_sel_fb;
+assign ss_fb_addr  = 16'(ss_state_addr - SS_OFF_FB);
+assign ss_fb_we    = ss_state_we & ss_sel_fb;
+
+// Work RAM, VRAM and Z80 RAM share one port into gen.
+wire ss_sel_gen_mem = ss_sel_work_ram | ss_sel_vram | ss_sel_zram;
+assign ss_gen_mem_sel   = ss_sel_vram ? 2'd1 : ss_sel_zram ? 2'd2 : 2'd0;
+assign ss_gen_mem_addr  = ss_sel_vram ? 16'(ss_state_addr - SS_OFF_VRAM) :
+                          ss_sel_zram ? 16'(ss_state_addr - SS_OFF_ZRAM) :
+                                        16'(ss_state_addr - SS_OFF_WORK_RAM);
+assign ss_gen_mem_wr_en = ss_state_we & ss_sel_gen_mem;
+
+// VDP internals.
+wire ss_sel_vdp = ss_sel_cram | ss_sel_vsram | ss_sel_obj | ss_sel_vdp_regs;
+assign ss_vdp_sel   = ss_sel_cram  ? 2'd0 :
+                      ss_sel_vsram ? 2'd1 :
+                      ss_sel_obj   ? 2'd2 : 2'd3;
+assign ss_vdp_addr  = ss_sel_cram  ? 8'(ss_state_addr - SS_OFF_CRAM)  :
+                      ss_sel_vsram ? 8'(ss_state_addr - SS_OFF_VSRAM) :
+                      ss_sel_obj   ? 8'(ss_state_addr - SS_OFF_OBJ)   :
+                                     8'(ss_state_addr - SS_OFF_VDP_REGS);
+assign ss_vdp_wr_en = ss_state_we & ss_sel_vdp;
+
+// 68000. One 16-bit fx68k word per 32-bit word. fx68k reads 0 above its used range
+// and ignores writes there. ss_wr_en may only pulse while the CPU is frozen: state_we
+// requires freeze_ack, and freeze_ack includes the frozen report.
+assign ss_m68k_addr  = 8'(ss_state_addr - SS_OFF_M68K_REGS);
+assign ss_m68k_wr_en = ss_state_we & ss_sel_m68k;
+
+// FM: one YM2612 register of the shadow per word, 512 of them, and in bits 31-8 the
+// state of the chip (fm_savestate.sv). A word of chip state takes 24 clocks.
+assign ss_fm_addr  = 9'(ss_state_addr - SS_OFF_FM_SHADOW);
+assign ss_fm_wr_en = ss_state_we & ss_sel_fm;
+assign ss_fm_rd_en = ss_state_wr & ss_sel_fm;
+
+// jt89 decodes 3 address bits, so the reserved tail of the region must not alias.
+assign ss_psg_addr  = 3'(ss_state_addr - SS_OFF_PSG_REGS);
+assign ss_psg_wr_en = ss_state_we & ss_sel_psg & (ss_state_addr < SS_OFF_PSG_REGS + 32'd8);
+
+// Words 0-3 are the I/O registers, 4-5 the bus arbiter, 6 the park timing (gen.sv);
+// 7 is spare.
+assign ss_sys_addr  = 3'(ss_state_addr - SS_OFF_SYS_REGS);
+assign ss_sys_wr_en = ss_state_we & ss_sel_sys & (ss_sys_addr != 3'd7);
+
+// Cart: mapper registers, or the EEPROM data while ss_sel_eeprom.
+assign ss_cart_addr  = ss_sel_eeprom ? 10'(ss_state_addr - SS_OFF_EEPROM) : 10'(ss_state_addr - SS_OFF_CART_REGS);
+assign ss_cart_wr_en = ss_state_we & (ss_sel_cart | ss_sel_eeprom);
+
+// Z80 state. Words 0-6 hold the 212 bits of T80 REG. Word 7:
+//   bits 8-0: bank register (A23-A15)
+//   bit 9:    BUSRQ_N, bit 10: RESET_N (A11100 and A11200)
+//   bit 11:   HALT
+//   bit 12:   words 8-11 hold T80 SEQ (bits 119-0), the rest of an instruction the bus
+//             request stopped (BUSAK low, SEQ bit 0)
+// Words 12-31 are spare. Word 7 restores the bank and the bus lines at once (EXT_SET).
+// The registers are restored by one DIRSet pulse, two clocks after word 11: T80 latches
+// the whole register file at once, and a Z80 taken out of reset by word 7 must be out of
+// it by then.
+wire [4:0] ss_z80_word = 5'(ss_state_addr - SS_OFF_Z80_REGS);
+reg  [119:0] ss_z80_seq_dir_r;
+reg          ss_z80_seq_ok;
+reg          ss_z80_dirset_d;
+always @(posedge clk_sys) begin
+	ss_z80_dirset_d <= 0;
+	ss_z80_dirset   <= ss_z80_dirset_d;
+	ss_z80_ext_set  <= 0;
+	if(ss_state_we & ss_sel_z80) begin
+		case(ss_z80_word)
+			5'd0: ss_z80_dir[ 31:  0] <= ss_state_dout;
+			5'd1: ss_z80_dir[ 63: 32] <= ss_state_dout;
+			5'd2: ss_z80_dir[ 95: 64] <= ss_state_dout;
+			5'd3: ss_z80_dir[127: 96] <= ss_state_dout;
+			5'd4: ss_z80_dir[159:128] <= ss_state_dout;
+			5'd5: ss_z80_dir[191:160] <= ss_state_dout;
+			5'd6: ss_z80_dir[211:192] <= ss_state_dout[19:0];
+			5'd7: begin
+				ss_z80_halt_dir <= ss_state_dout[11];
+				ss_z80_bar_dir  <= ss_state_dout[8:0];
+				ss_z80_ctrl_dir <= ss_state_dout[10:9];
+				ss_z80_ext_set  <= 1;
+				ss_z80_seq_ok   <= ss_state_dout[12];
+			end
+			5'd8:  ss_z80_seq_dir_r[ 31: 0] <= ss_state_dout;
+			5'd9:  ss_z80_seq_dir_r[ 63:32] <= ss_state_dout;
+			5'd10: ss_z80_seq_dir_r[ 95:64] <= ss_state_dout;
+			5'd11: begin
+				ss_z80_seq_dir_r[119:96] <= ss_state_dout[23:0];
+				ss_z80_dirset_d <= 1;   // Last word, latch all registers.
+			end
+			default: ;
+		endcase
+	end
+end
+assign ss_z80_seq_dir = ss_z80_seq_ok ? ss_z80_seq_dir_r : 120'd0;
+
+
+//////////////////  SDRAM-backed regions: cart SRAM, Sega Channel cart ROM  //////////////////
+// The only regions not in block RAM or flops. SDRAM port 3 serves ROM loading and the
+// backup RAM transfers, neither of which runs during a savestate, so the stream takes
+// it. The SDRAM latency varies, so the engine waits on state_ready. Port select, address
+// and data are registered with the strobes, which keeps the region decode of the state
+// address out of the clk_ram paths.
+assign ss_sram_addr = 15'(ss_state_addr - SS_OFF_SRAM);
+assign ss_crom_addr = 20'(ss_state_addr - SS_OFF_CROM);
+
+// One SDRAM word per state word for the SRAM, two (low halfword first) for the cart ROM.
+reg  [1:0] ss_sdr_st = 0;
+reg [31:0] ss_sdr_data;
+reg        ss_sdr_ready = 0;
+reg [31:0] ss_sdr_addr_d;
+reg        ss_sdr_load;
+always @(posedge clk_sys) begin
+	ss_sdr_addr_d <= ss_state_addr;
+	ss_sdr_own    <= ss_freeze_active & (ss_sel_sram | ss_sel_crom);
+
+	if(!ss_freeze_active) begin
+		ss_sdr_st <= 0; ss_sdr_rd <= 0; ss_sdr_wr <= 0; ss_sdr_ready <= 0; ss_sdr_hi <= 0;
+	end else case(ss_sdr_st)
+		// Idle. state_wr reads from the core for a save, state_we writes for a load.
+		2'd0: begin
+			ss_sdr_ready <= 0;
+			ss_sdr_hi    <= 0;
+			if((ss_sel_sram | ss_sel_crom) && (ss_state_wr | ss_state_we)) begin
+				ss_sdr_rd   <= ~ss_state_we;
+				ss_sdr_wr   <=  ss_state_we;
+				ss_sdr_load <=  ss_state_we;
+				ss_sdr_a    <= ss_sel_crom ? {4'b0000, ss_crom_addr, 1'b0} : {10'b1100000000, ss_sram_addr};
+				ss_sdr_d    <= ss_state_dout[15:0];
+				ss_sdr_st <= 2'd1;
+			end
+		end
+		// Wait for the controller to take the request (busy rises).
+		2'd1: if(sdr_busy[3]) ss_sdr_st <= 2'd2;
+		// Drop the strobes and wait for completion. dout is valid as busy falls.
+		2'd2: begin
+			ss_sdr_rd <= 0;
+			ss_sdr_wr <= 0;
+			if(!sdr_busy[3]) begin
+				if(ss_sdr_hi) ss_sdr_data[31:16] <= sdr_do[3];
+				else          ss_sdr_data <= {16'd0, sdr_do[3]};
+				if(ss_sel_crom && !ss_sdr_hi) begin
+					ss_sdr_hi   <= 1;
+					ss_sdr_rd   <= ~ss_sdr_load;
+					ss_sdr_wr   <=  ss_sdr_load;
+					ss_sdr_a[1] <= 1;
+					ss_sdr_d    <= ss_state_dout[31:16];
+					ss_sdr_st   <= 2'd1;
+				end else begin
+					ss_sdr_ready <= 1;
+					ss_sdr_st    <= 2'd3;
+				end
+			end
+		end
+		// Hold ready until the engine moves on, then arm for the next word.
+		2'd3: if(ss_state_addr != ss_sdr_addr_d) begin
+			ss_sdr_ready <= 0;
+			ss_sdr_st    <= 2'd0;
+		end
+	endcase
+end
+
+//////////////////  DDR3-backed region: 32X SDRAM  //////////////////
+// The SH-2 SDRAM lives in DDR3 (ddram.sv, 0x30000000), with a block RAM copy of its low
+// 32KB and a small read cache in front. The stream reads and writes the DDR3 words
+// through ddram's ssm channel, two SDRAM words per savestate word, after any posted
+// SH-2 write; a load also rewrites the low copy. The read cache state (SS_OFF_RC words
+// of the 32X block) goes through the same channel: a load puts it back after the last
+// SDRAM word and refetches its lines, so the SH-2 hits and misses as before the save.
+// The SH-2 port itself is left untouched, so its timing does not change.
+reg   [1:0] ss_ssm_ack_s = 0;
+reg   [1:0] ss_ssm_st = 0;
+reg  [31:0] ss_ssm_data;
+reg         ss_ssm_ready = 0;
+always @(posedge clk_sys) begin
+	ss_ssm_ack_s <= {ss_ssm_ack_s[0], ss_ssm_ack};
+
+	if(!ss_freeze_active) begin
+		ss_ssm_st <= 0; ss_ssm_ready <= 0;
+	end else case(ss_ssm_st)
+		2'd0: begin
+			ss_ssm_ready <= 0;
+			if((ss_sel_sdr32 | ss_sel_rc) && (ss_state_wr | ss_state_we)) begin
+				ss_ssm_addr  <= ss_sel_rc ? 16'(ss_32x_addr - 16'(S32X_PKG::SS_OFF_RC)) : 16'(ss_state_addr - SS_OFF_SDR32);
+				ss_ssm_cache <= ss_sel_rc;
+				ss_ssm_we    <= ss_state_we;
+				ss_ssm_din   <= ss_state_dout;
+				ss_ssm_req   <= ~ss_ssm_req;
+				ss_ssm_st   <= 2'd1;
+			end
+		end
+		2'd1: if(ss_ssm_ack_s[1] == ss_ssm_req) begin
+			ss_ssm_data  <= ss_ssm_dout;
+			ss_ssm_ready <= 1;
+			ss_ssm_st    <= 2'd2;
+		end
+		// Hold ready until the engine moves on, then arm for the next word.
+		2'd2: if(ss_state_addr != ss_sdr_addr_d) begin
+			ss_ssm_ready <= 0;
+			ss_ssm_st    <= 2'd0;
+		end
+	endcase
+end
+
+// Regions that answer in the engine's fixed 4-cycle window never stall it.
+wire ss_state_ready = (ss_sel_sram | ss_sel_crom) ? ss_sdr_ready :
+                      ss_sel_sdr32 ? ss_ssm_ready  :
+                      ss_sel_rc    ? ss_ssm_ready  :
+                      ss_sel_fm    ? ss_fm_ready   : 1'b1;
+
+
+// Read chain. Words 0 and 1 are the header checked on load. Reserved tails read 0.
+reg [31:0] ss_state_din;
+always @(posedge clk_sys) begin
+	if(ss_sel_gen_mem)
+		ss_state_din <= {16'd0, ss_gen_mem_rd_data};
+	else if(ss_sel_sram | ss_sel_crom)
+		ss_state_din <= ss_sdr_data;
+	else if(ss_sel_eeprom | ss_sel_cart)
+		ss_state_din <= ss_cart_rd_data;
+	else if(ss_sel_vdp)
+		ss_state_din <= ss_vdp_rd_data;
+	else if(ss_sel_m68k)
+		ss_state_din <= {16'd0, ss_m68k_rd_data};
+	else if(ss_sel_fm)
+		ss_state_din <= ss_fm_rd_data;
+	else if(ss_sel_psg)
+		ss_state_din <= ss_psg_rd_data;
+	else if(ss_sel_rc)
+		ss_state_din <= ss_ssm_data;
+	else if(ss_sel_32x)
+		ss_state_din <= ss_32x_rd_data;
+	else if(ss_sel_sdr32)
+		ss_state_din <= ss_ssm_data;
+	else if(ss_sel_fb)
+		ss_state_din <= {S32X_FB1_DI, S32X_FB0_DI};
+	else if(ss_sel_svp)
+		ss_state_din <= (ss_svp_addr == 11'h3FF) ? {31'd0, svp_ce_ph} : ss_svp_rd;
+	else if(ss_sel_sys)
+		ss_state_din <= (ss_sys_addr == 3'd6) ? {18'd0, ss_rfs_park, ss_sys_rd_data[3:0]} :
+		                (ss_sys_addr != 3'd7) ? ss_sys_rd_data : 32'd0;
+	else if(ss_sel_z80)
+		ss_state_din <= (ss_z80_word == 5'd0) ? ss_z80_reg[ 31:  0] :
+		                (ss_z80_word == 5'd1) ? ss_z80_reg[ 63: 32] :
+		                (ss_z80_word == 5'd2) ? ss_z80_reg[ 95: 64] :
+		                (ss_z80_word == 5'd3) ? ss_z80_reg[127: 96] :
+		                (ss_z80_word == 5'd4) ? ss_z80_reg[159:128] :
+		                (ss_z80_word == 5'd5) ? ss_z80_reg[191:160] :
+		                (ss_z80_word == 5'd6) ? {12'd0, ss_z80_reg[211:192]} :
+		                (ss_z80_word == 5'd7) ? {19'd0, 1'b1, ss_z80_halt, ss_z80_ctrl, ss_z80_bar} :
+		                (ss_z80_word == 5'd8) ? ss_z80_seq[ 31: 0] :
+		                (ss_z80_word == 5'd9) ? ss_z80_seq[ 63:32] :
+		                (ss_z80_word == 5'd10) ? ss_z80_seq[ 95:64] :
+		                (ss_z80_word == 5'd11) ? {8'd0, ss_z80_seq[119:96]} : 32'd0;
+	else case(ss_state_addr)
+		0: ss_state_din <= SS_MAGIC;
+		1: ss_state_din <= {SS_VERSION[7:0], ss_state_size[23:0]};
+		default: ss_state_din <= 32'd0;
+	endcase
+end
+
+
+//////////////////  DDR3 bridge  //////////////////
+// The engine runs on clk_sys. ddram.sv owns the DDR3 port on clk_ram and serves one
+// savestate word per toggle request, after any 32X SDRAM traffic.
+wire        ss_e_ddr_rd, ss_e_ddr_we;
+wire [28:0] ss_e_ddr_addr;
+wire [63:0] ss_e_ddr_din;
+reg         ss_ddr_pend = 0;
+reg         ss_ddr_rdy = 0;
+reg   [1:0] ss_ddr_ack_s = 0;
+always @(posedge clk_sys) begin
+	ss_ddr_ack_s <= {ss_ddr_ack_s[0], ss_ddr_ack};
+	ss_ddr_rdy   <= 0;
+	if(ss_e_ddr_rd | ss_e_ddr_we) begin
+		ss_ddr_addr <= ss_e_ddr_addr;
+		ss_ddr_din  <= ss_e_ddr_din;
+		ss_ddr_we   <= ss_e_ddr_we;
+		ss_ddr_req  <= ~ss_ddr_req;
+		ss_ddr_pend <= 1;
+	end
+	else if(ss_ddr_pend && ss_ddr_ack_s[1] == ss_ddr_req) begin
+		ss_ddr_pend <= 0;
+		ss_ddr_rdy  <= ~ss_ddr_we;
+	end
+end
+
+savestate savestate_inst
+(
+	.clk(clk_sys),
+	.reset(reset),
+
+	.DDRAM_BUSY(ss_ddr_pend),
+	.DDRAM_BURSTCNT(),
+	.DDRAM_ADDR(ss_e_ddr_addr),
+	.DDRAM_DOUT(ss_ddr_dout),
+	.DDRAM_DOUT_READY(ss_ddr_rdy),
+	.DDRAM_RD(ss_e_ddr_rd),
+	.DDRAM_DIN(ss_e_ddr_din),
+	.DDRAM_BE(),
+	.DDRAM_WE(ss_e_ddr_we),
+
+	.ss_slot(ss_slot_reg),
+	.ss_save(ss_save_req),
+	.ss_load(ss_load_req),
+	.state_size(ss_state_size),
+	.ss_busy(ss_busy),
+	.ss_save_done(ss_save_done),
+	.ss_load_done(ss_load_done),
+	.load_hold(1'b0),
+
+	.freeze_req(ss_freeze_req),
+	.freeze_ack(ss_freeze_ack),
+
+	.state_addr(ss_state_addr),
+	.state_wr(ss_state_wr),
+	.state_rd(ss_state_rd),
+	.state_din(ss_state_din),
+	.state_dout(ss_state_dout),
+	.state_we(ss_state_we),
+	.state_ready(ss_state_ready),
+
+	.hdr_magic(SS_MAGIC),
+	.hdr_version(SS_VERSION),
+	.hdr_size(ss_state_size)
+);
 
 endmodule
