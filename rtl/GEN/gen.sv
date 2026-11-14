@@ -119,6 +119,8 @@ module gen
 	input   [1:0] SER_OPT,
 
 	input         MEM_RDY,
+	output        VBUS_DMA,     // VDP DMA word request on the 68000 bus (SVP DMA_ACTIVE)
+	input         ROM_DMA_DEC,  // SVP cartridge: VDP DMA from the ROM reads one word behind
 
 	input         GG_RESET,
 	input         GG_EN,
@@ -360,6 +362,7 @@ wire        YM_N;
 wire [23:1] VBUS_A;
 wire [15:0] VBUS_D;
 wire        VBUS_SEL;
+assign VBUS_DMA = VBUS_SEL;
 wire        VBUS_DTACK_N;
 wire        VBUS_BR_N;
 wire        VBUS_BG_N;
@@ -449,6 +452,7 @@ BA ba
 	.VBUS_BGACK_N(VBUS_BGACK_N),
 	
 	.MEM_RDY(MEM_RDY),
+	.ROM_DMA_DEC(ROM_DMA_DEC),
 	.PAUSE_EN(PAUSE_EN)
 );
 
