@@ -657,6 +657,7 @@ wire  [7:0] CART_SRAM_DI;
 wire  [7:0] CART_SRAM_DO;
 wire        CART_SRAM_WR;
 wire        CART_SRAM_RD;
+wire        CART_EP_RD, CART_EP_WR;
 CART cart
 (
 	.CLK(clk_sys),
@@ -688,11 +689,14 @@ CART cart
 	.SRAM_DO(CART_SRAM_DO),
 	.SRAM_RD(CART_SRAM_RD),
 	.SRAM_WR(CART_SRAM_WR),
+	.EP_RD(CART_EP_RD),
+	.EP_WR(CART_EP_WR),
 	
 	.rom_sz(rom_sz),
 	.s32x(s32x_rom),
 	.eeprom_map(eeprom_map),
 	.noram_quirk(noram_quirk),
+	.pier_quirk(pier_quirk),
 	.realtec_map(realtec_map),
 	.sf_map(sf_map)
 );
@@ -756,8 +760,8 @@ sdram sdram
 	.addr2({10'b1100000000,CART_SRAM_A[15:1]}),	//CART RAM 3000000-300FFFF
 	.din2({8'hFF,CART_SRAM_DO}),
 	.dout2(sdr_do[2]),
-	.rd2(CART_SRAM_RD),
-	.wr2({2{CART_SRAM_WR}}),
+	.rd2(CART_SRAM_RD | CART_EP_RD),
+	.wr2({2{CART_SRAM_WR | CART_EP_WR}}),
 	.busy2(sdr_busy[2]),
 	
 	//ROM/BRAM Load/Save
@@ -1205,7 +1209,7 @@ end
 
 /////////////////////////  BRAM SAVE/LOAD  /////////////////////////////
 wire downloading = rom_download;
-wire bk_change  = CART_SRAM_WR;
+wire bk_change  = CART_SRAM_WR | CART_EP_WR;
 wire autosave   = status[13];
 wire bk_load    = status[16];
 wire bk_save    = status[17];

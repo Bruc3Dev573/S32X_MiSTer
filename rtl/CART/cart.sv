@@ -29,49 +29,72 @@ module CART
 	output      [7:0] SRAM_DO,
 	output            SRAM_RD,
 	output            SRAM_WR,
+	// Pier Solar EEPROM, on the SRAM channel: read and write requests (edges count).
+	output reg        EP_RD,
+	output            EP_WR,
 	
 	input      [25:0] rom_sz,
 	input             s32x,					//[3] EPPROM bank present, [2:0] 0:none,1:128B,2:128B,3:256B
 	input       [3:0] eeprom_map,
 	input             noram_quirk,
 	input             realtec_map,
+	input             pier_quirk,
 	input       [2:0] sf_map					//[2] SRAM bank present, [1:0] 0:none,1:SF-001,2:SF-002,3:SF-004
 );
 
-	reg old_LWR_N, old_UWR_N;
+	reg old_LWR_N, old_UWR_N, old_CAS0_N;
 	always @(posedge CLK) begin
 		old_LWR_N <= LWR_N;
 		old_UWR_N <= UWR_N;
+		old_CAS0_N <= CAS0_N;
 	end
 	
-	//SRAM, SFF2 mappers
+	//SRAM, SFF2 and Pier Solar mappers
 	reg         SRAM_BANK;
 	reg   [5:0] ROM_BANK[8];
 	reg         ROM_BANK_EN;
 	reg         ROM_BANK_WP;
+	// Pier Solar: EEPROM pins (A130F9) and the protection reads at 15E6/15E8 counted so far.
+	reg         EP_CS, EP_HOLD, EP_SCK, EP_SI;
+	reg   [2:0] PIER_COUNT;
+	reg         PIER_HIT;
+	wire        PIER_PROT_A = pier_quirk && (VA == 23'h000AF3 || VA == 23'h000AF4);
 	always @(posedge CLK) begin
+		EP_RD <= 0;
 		if (!RST_N) begin
 			SRAM_BANK <= 0;
 			ROM_BANK_EN <= 0;
 			ROM_BANK_WP <= 0;
 			ROM_BANK <= '{0,1,2,3,4,5,6,7};
+			{EP_CS, EP_HOLD, EP_SCK, EP_SI} <= 4'd0;
+			PIER_COUNT <= 0;
+			PIER_HIT <= 0;
 		end else begin
+			// The protection reads return their data at the end of the access.
+			if (!CAS0_N && old_CAS0_N && PIER_PROT_A) PIER_HIT <= 1;
+			if (CAS0_N && !old_CAS0_N && PIER_HIT) begin
+				PIER_HIT <= 0;
+				if (PIER_COUNT < 3'd6) PIER_COUNT <= PIER_COUNT + 1'd1;
+			end
+
 			if (!TIME_N) begin
 				if (!LWR_N && old_LWR_N) begin
 					if (rom_sz > 'h200000) begin // SSF2/Pier Solar ROM banking
 						if (VA[3:1]) begin
 							ROM_BANK_EN <= 1;
-//							if (~PIER_QUIRK) begin // SSF2
+							if (!pier_quirk) begin // SSF2
 								ROM_BANK[VA[3:1]] <= VDI[5:0];
-//							end
-//							else if (MBUS_A[3:1] == 4) begin // Pier EEPROM
-//								{ep_cs, ep_hold , ep_sck, ep_si} <= MBUS_DO[3:0];
-//							end
-//							else if (~MBUS_A[3]) begin // Pier Banks
-//								ROM_BANK[{1'b1,MBUS_A[2:1]}] <= MBUS_DO[3:0];
-//							end
+							end
+							else if (VA[3:1] == 3'd4) begin // Pier EEPROM
+								{EP_CS, EP_HOLD, EP_SCK, EP_SI} <= VDI[3:0];
+								// SCK falling: fetch the byte the EEPROM shifts out on the next rise.
+								if (EP_SCK && !VDI[1]) EP_RD <= 1;
+							end
+							else if (!VA[3]) begin // Pier banks
+								ROM_BANK[{1'b1,VA[2:1]}] <= {2'b00, VDI[3:0]};
+							end
 						end
-						else /*if (~PIER_QUIRK)*/ begin // SRAM control only in the first register on SSF2 mapper
+						else if (!pier_quirk) begin // SRAM control only in the first register on SSF2 mapper
 							{ROM_BANK_WP,SRAM_BANK} <= VDI[1:0];
 						end
 					end else begin
@@ -81,6 +104,29 @@ module CART
 			end
 		end
 	end
+	wire [15:0] PIER_PROT_DO = PIER_COUNT < 3'd6 ? (VA[1] ? 16'h0000 : 16'h0010) : (VA[1] ? 16'h0001 : 16'h8010);
+
+	// Pier Solar M95320 EEPROM, its 4KB in the cart SRAM (SDRAM) at bytes 0-FFF.
+	wire        M95_SO;
+	wire [11:0] M95_A;
+	wire  [7:0] M95_DI;
+	wire        M95_WE;
+	STM95XXX pier_eeprom
+	(
+		.clk(CLK),
+		.enable(pier_quirk),
+		.so(M95_SO),
+		.si(EP_SI),
+		.sck(EP_SCK),
+		.hold_n(EP_HOLD),
+		.cs_n(EP_CS),
+		.wp_n(1'b1),
+		.ram_addr(M95_A),
+		.ram_q(SRAM_DI),
+		.ram_di(M95_DI),
+		.ram_we(M95_WE)
+	);
+	assign EP_WR = pier_quirk & M95_WE;
 	wire ROM_LIN_EN = (rom_sz > 'h400000) & ~ROM_BANK_EN & ~s32x;	//Linear mapper
 	wire [24:1] ROM_BANK_A = ROM_BANK_EN ? {ROM_BANK[VA[21:19]], VA[18:1]} : 
 	                         ROM_LIN_EN  ? {1'b0,VA[23:1]} :
@@ -244,18 +290,21 @@ module CART
 	assign ROM_RD = ROM_ACCESS & ~SRAM_ACCESS & ~CAS0_N;
 	assign {ROM_WRH,ROM_WRL} = {ROM_ACCESS&~UWR_N,ROM_ACCESS&~LWR_N};
 	
-	assign SRAM_A = realtec_map         ? VA[15:1] : 
+	assign SRAM_A = pier_quirk          ? {3'b000, M95_A} :
+	                realtec_map         ? VA[15:1] :
 					    sf_map[1:0] == 2'd1 ? SF001_SRAM_A : 
 						 sf_map[1:0] == 2'd2 ? SF002_SRAM_A : 
 						 sf_map[1:0] == 2'd3 ? SF004_SRAM_A : 
 						                       SRAM_BANK_A;
-	assign SRAM_DO = VDI[7:0];
+	assign SRAM_DO = pier_quirk ? M95_DI : VDI[7:0];
 	assign SRAM_RD = SRAM_ACCESS & ~CAS0_N;
 	assign SRAM_WR = SRAM_ACCESS & ~LWR_N;
 	
 	assign VDO = EEPROM_EN ? EEPROM_DO : 
-	             !TIME_N && CE0_N ? (sf_map[1:0] == 2'd3 ? SF004_DO : 16'h0000) :
+	             !TIME_N && CE0_N ? (sf_map[1:0] == 2'd3 ? SF004_DO :
+	                                 pier_quirk && VA[3:1] == 3'd5 ? {15'h7FFF, M95_SO} : 16'h0000) :
 					 SRAM_ACCESS ? {8'hFF,SRAM_DI} : 
+					 PIER_PROT_A && ROM_ACCESS ? PIER_PROT_DO :
 					 ROM_ACCESS ? ROM_DI : 
 	             16'h0000;
 	assign DTACK_N = ~(ROM_LIN_EN & ~AS_N & (VA[23:22] == 2'b10));
