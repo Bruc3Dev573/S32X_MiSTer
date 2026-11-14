@@ -39,8 +39,21 @@ module CART
 	input             noram_quirk,
 	input             realtec_map,
 	input             pier_quirk,
-	input       [2:0] sf_map					//[2] SRAM bank present, [1:0] 0:none,1:SF-001,2:SF-002,3:SF-004
+	input       [2:0] sf_map,					//[2] SRAM bank present, [1:0] 0:none,1:SF-001,2:SF-002,3:SF-004
+	// Set once the SSF2 bank registers have mapped a page at 4MB or above. The savestate
+	// covers writable cartridge memory (Sega Channel) only below 4MB (S32X.sv).
+	output reg        ROM_BANK_HI,
+	
+	// Savestate. SS_SEL 0: mapper registers, words 0-7. SS_SEL 1: EEPROM data, one byte per word.
+	input             SS_ACTIVE,
+	input             SS_SEL,
+	input       [9:0] SS_ADDR,
+	input      [31:0] SS_WR_DATA,
+	input             SS_WR_EN,
+	output     [31:0] SS_RD_DATA
 );
+
+	wire ss_reg_we = SS_WR_EN & ~SS_SEL;
 
 	reg old_LWR_N, old_UWR_N, old_CAS0_N;
 	always @(posedge CLK) begin
@@ -60,6 +73,8 @@ module CART
 	reg         PIER_HIT;
 	wire        PIER_PROT_A = pier_quirk && (VA == 23'h000AF3 || VA == 23'h000AF4);
 	always @(posedge CLK) begin
+		reg old_ss_active;
+		old_ss_active <= SS_ACTIVE;
 		EP_RD <= 0;
 		if (!RST_N) begin
 			SRAM_BANK <= 0;
@@ -69,7 +84,17 @@ module CART
 			{EP_CS, EP_HOLD, EP_SCK, EP_SI} <= 4'd0;
 			PIER_COUNT <= 0;
 			PIER_HIT <= 0;
+		end else if (ss_reg_we && SS_ADDR[2:0] == 3'd0) begin
+			{ROM_BANK_WP, ROM_BANK_EN, SRAM_BANK, ROM_BANK[3], ROM_BANK[2], ROM_BANK[1], ROM_BANK[0]} <= SS_WR_DATA[26:0];
+		end else if (ss_reg_we && SS_ADDR[2:0] == 3'd1) begin
+			{ROM_BANK[7], ROM_BANK[6], ROM_BANK[5], ROM_BANK[4]} <= SS_WR_DATA[23:0];
+		end else if (ss_reg_we && SS_ADDR[2:0] == 3'd7) begin
+			{EP_CS, EP_HOLD, EP_SCK, EP_SI, PIER_COUNT} <= SS_WR_DATA[6:0];
 		end else begin
+			// After a load the EEPROM's current byte is read again: the SRAM channel's last
+			// read is not part of the image.
+			if (old_ss_active && !SS_ACTIVE) EP_RD <= pier_quirk;
+
 			// The protection reads return their data at the end of the access.
 			if (!CAS0_N && old_CAS0_N && PIER_PROT_A) PIER_HIT <= 1;
 			if (CAS0_N && !old_CAS0_N && PIER_HIT) begin
@@ -104,6 +129,16 @@ module CART
 			end
 		end
 	end
+
+	always @(posedge CLK) begin
+		if (!RST_N)
+			ROM_BANK_HI <= 0;
+		else if (ss_reg_we && SS_ADDR[2:0] == 3'd1)
+			ROM_BANK_HI <= SS_WR_DATA[24];
+		else if (ROM_BANK_EN && (|ROM_BANK[0][5:3] || |ROM_BANK[1][5:3] || |ROM_BANK[2][5:3] || |ROM_BANK[3][5:3] ||
+		                         |ROM_BANK[4][5:3] || |ROM_BANK[5][5:3] || |ROM_BANK[6][5:3] || |ROM_BANK[7][5:3]))
+			ROM_BANK_HI <= 1;
+	end
 	wire [15:0] PIER_PROT_DO = PIER_COUNT < 3'd6 ? (VA[1] ? 16'h0000 : 16'h0010) : (VA[1] ? 16'h0001 : 16'h8010);
 
 	// Pier Solar M95320 EEPROM, its 4KB in the cart SRAM (SDRAM) at bytes 0-FFF.
@@ -111,6 +146,7 @@ module CART
 	wire [11:0] M95_A;
 	wire  [7:0] M95_DI;
 	wire        M95_WE;
+	wire [54:0] M95_SS_Q;
 	STM95XXX pier_eeprom
 	(
 		.clk(CLK),
@@ -124,7 +160,11 @@ module CART
 		.ram_addr(M95_A),
 		.ram_q(SRAM_DI),
 		.ram_di(M95_DI),
-		.ram_we(M95_WE)
+		.ram_we(M95_WE),
+		.ss_we_hi(ss_reg_we && SS_ADDR[2:0] == 3'd6),
+		.ss_we_lo(ss_reg_we && SS_ADDR[2:0] == 3'd7),
+		.ss_d({SS_WR_DATA, SS_WR_DATA[29:7]}),
+		.ss_q(M95_SS_Q)
 	);
 	assign EP_WR = pier_quirk & M95_WE;
 	wire ROM_LIN_EN = (rom_sz > 'h400000) & ~ROM_BANK_EN & ~s32x;	//Linear mapper
@@ -148,6 +188,8 @@ module CART
 			EEPROM_BANK <= 0;
 			EEPROM_SDAI <= 1;
 			EEPROM_SCL <= 1;
+		end else if (ss_reg_we && SS_ADDR[2:0] == 3'd2) begin
+			{EEPROM_BANK, EEPROM_SDAI, EEPROM_SCL} <= SS_WR_DATA[13:11];
 		end else if (eeprom_map) begin
 			if (VA[23:21] == 3'b001 && !CE0_N && ((!LWR_N && old_LWR_N) || (!UWR_N && old_UWR_N))) begin
 				if (!LWR_N && !UWR_N) EEPROM_BANK <= ~VDI[0];
@@ -167,6 +209,7 @@ module CART
 	
 	wire [1:0] EEPROM_MODE = eeprom_map[2:0] <= 3'b010 ? 2'd0 : 2'd1;
 	wire [12:0] EEPROM_MASK = eeprom_map[2:0] <= 3'b010 ? 13'h07F : 13'h0FF;
+	wire [31:0] EEPROM_SS_RD;
 	EPPROM_24CXX E24CXX
 	(
 		.clk(CLK),
@@ -183,15 +226,22 @@ module CART
 		.ram_addr(EEPROM_RAM_A),
 		.ram_d(EEPROM_RAM_D),
 		.ram_wr(EEPROM_RAM_WE),
-		.ram_q(EEPROM_RAM_Q)
+		.ram_q(EEPROM_RAM_Q),
+		
+		.ss_addr(SS_ADDR[0]),
+		.ss_wr_data(SS_WR_DATA),
+		.ss_wr_en(ss_reg_we && SS_ADDR[2:1] == 2'b10),
+		.ss_rd_data(EEPROM_SS_RD)
 	);
 	
+	// The stream takes the single EEPROM RAM port while frozen.
+	wire ss_eep_sel = SS_ACTIVE & SS_SEL;
 	spram #(10,8) eeprom_ram
 	(
 		.clock(CLK),
-		.address(EEPROM_RAM_A[9:0]),
-		.data(EEPROM_RAM_D),
-		.wren(EEPROM_RAM_WE),
+		.address(ss_eep_sel ? SS_ADDR : EEPROM_RAM_A[9:0]),
+		.data(ss_eep_sel ? SS_WR_DATA[7:0] : EEPROM_RAM_D),
+		.wren(ss_eep_sel ? SS_WR_EN : EEPROM_RAM_WE),
 		.q(EEPROM_RAM_Q)
 	);
 	
@@ -204,6 +254,8 @@ module CART
 			REALTEC_BANK <= '0;
 			REALTEC_MASK <= '0;
 			REALTEC_BOOT <= realtec_map;
+		end else if (ss_reg_we && SS_ADDR[2:0] == 3'd2) begin
+			{REALTEC_BOOT, REALTEC_MASK, REALTEC_BANK} <= SS_WR_DATA[10:0];
 		end else begin
 			if (realtec_map) begin
 				if (VA[23:16] == 8'h40 && !	VA[11:1] && !UWR_N && old_UWR_N) begin
@@ -240,6 +292,8 @@ module CART
 			SF004_SRAM_REG <= 0;
 			SF004_BANK_REG <= 8'h80;
 			SF004_FIRST_PAGE <= '0;
+		end else if (ss_reg_we && SS_ADDR[2:0] == 3'd3) begin
+			{SF004_FIRST_PAGE, SF004_BANK_REG, SF004_SRAM_REG, SF002_BANK_REG, SF001_BANK_REG} <= SS_WR_DATA[27:0];
 		end else begin
 			if (sf_map == 2'd1) begin	//SF-001
 				if (!SF001_BANK_REG[5] && VA[23:16] == 8'h00 && !LWR_N && old_LWR_N) begin
@@ -291,7 +345,7 @@ module CART
 	assign {ROM_WRH,ROM_WRL} = {ROM_ACCESS&~UWR_N,ROM_ACCESS&~LWR_N};
 	
 	assign SRAM_A = pier_quirk          ? {3'b000, M95_A} :
-	                realtec_map         ? VA[15:1] :
+	                realtec_map         ? VA[15:1] : 
 					    sf_map[1:0] == 2'd1 ? SF001_SRAM_A : 
 						 sf_map[1:0] == 2'd2 ? SF002_SRAM_A : 
 						 sf_map[1:0] == 2'd3 ? SF004_SRAM_A : 
@@ -308,5 +362,14 @@ module CART
 					 ROM_ACCESS ? ROM_DI : 
 	             16'h0000;
 	assign DTACK_N = ~(ROM_LIN_EN & ~AS_N & (VA[23:22] == 2'b10));
+	
+	assign SS_RD_DATA = SS_SEL                 ? {24'd0, EEPROM_RAM_Q} :
+	                    SS_ADDR[2:0] == 3'd0   ? {5'd0, ROM_BANK_WP, ROM_BANK_EN, SRAM_BANK, ROM_BANK[3], ROM_BANK[2], ROM_BANK[1], ROM_BANK[0]} :
+	                    SS_ADDR[2:0] == 3'd1   ? {7'd0, ROM_BANK_HI, ROM_BANK[7], ROM_BANK[6], ROM_BANK[5], ROM_BANK[4]} :
+	                    SS_ADDR[2:0] == 3'd2   ? {18'd0, EEPROM_BANK, EEPROM_SDAI, EEPROM_SCL, REALTEC_BOOT, REALTEC_MASK, REALTEC_BANK} :
+	                    SS_ADDR[2:0] == 3'd3   ? {4'd0, SF004_FIRST_PAGE, SF004_BANK_REG, SF004_SRAM_REG, SF002_BANK_REG, SF001_BANK_REG} :
+	                    SS_ADDR[2:1] == 2'b10  ? EEPROM_SS_RD :
+	                    SS_ADDR[2:0] == 3'd6   ? M95_SS_Q[54:23] :
+	                                             {2'd0, M95_SS_Q[22:0], EP_CS, EP_HOLD, EP_SCK, EP_SI, PIER_COUNT};
 
 endmodule

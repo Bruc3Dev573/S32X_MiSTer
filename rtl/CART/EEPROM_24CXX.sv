@@ -19,7 +19,13 @@ module EPPROM_24CXX
 	output        ram_wr,
 	output        ram_rd,
 	
-	output [6:0]  dbg_last_state
+	output [6:0]  dbg_last_state,
+	
+	// Savestate, two words. Word 0: FSM, address, bit counter, flags. Word 1: shifters, pin filters.
+	input         ss_addr,
+	input  [31:0] ss_wr_data,
+	input         ss_wr_en,
+	output [31:0] ss_rd_data
 );
 
 	typedef enum bit [6:0] {
@@ -39,6 +45,8 @@ module EPPROM_24CXX
 		if (rst) begin
 			sda_old <= '1;
 			scl_old <= '1;
+		end else if (ss_wr_en && ss_addr) begin
+			{sda_old, scl_old} <= ss_wr_data[23:16];
 		end else if (en) begin
 			sda_old <= {sda_old[2:0],sda_i};
 			scl_old <= {scl_old[2:0],scl};
@@ -61,9 +69,8 @@ module EPPROM_24CXX
 	reg [7:0] dout;
 	reg       sack = 0;
 	reg       mack = 0;
+	reg       prestart;
 	always @(posedge clk) begin
-		reg prestart;
-		
 		if (rst) begin
 			prestart <= 0;
 			stop <= 0;
@@ -73,6 +80,12 @@ module EPPROM_24CXX
 			bit_cnt <= 4'hF;
 			sack <= 0;
 			mack <= 0;
+		end else if (ss_wr_en) begin
+			start <= 0;
+			stop <= 0;
+			cont <= 0;
+			if (!ss_addr) {prestart, run, sack, mack, bit_cnt} <= ss_wr_data[31:24];
+			else din <= ss_wr_data[7:0];
 		end else begin
 			start <= 0;
 			stop <= 0;
@@ -123,9 +136,9 @@ module EPPROM_24CXX
 	reg        rw;
 	reg        write;
 	reg        read;
+	reg        ack_old;
+	reg        read_delay;
 	always @(posedge clk) begin
-		reg ack_old;
-		reg read_delay;
 		reg pre_read_delay;
 		
 		if (rst) begin
@@ -134,6 +147,11 @@ module EPPROM_24CXX
 			rw <= 0;
 			write <= 0;
 			read <= 0;
+		end else if (ss_wr_en) begin
+			write <= 0;
+			read <= 0;
+			if (!ss_addr) begin state <= state_t'(ss_wr_data[19:13]); addr <= ss_wr_data[12:0]; end
+			else {rw, ack_old, read_delay, dout} <= {ss_wr_data[26:24], ss_wr_data[15:8]};
 		end else begin
 			read_delay <= read;
 			if (write) addr <= addr + 13'd1;
@@ -224,6 +242,9 @@ module EPPROM_24CXX
 	assign ram_d = din;
 	assign ram_wr = write;
 	assign ram_rd = read;
+	
+	assign ss_rd_data = !ss_addr ? {prestart, run, sack, mack, bit_cnt, 4'd0, state, addr} :
+	                               {5'd0, rw, ack_old, read_delay, sda_old, scl_old, dout, din};
 	
 
 endmodule

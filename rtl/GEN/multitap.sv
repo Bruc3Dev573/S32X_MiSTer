@@ -76,7 +76,13 @@ module multitap
 	input  [7:0] DI,
 	output [7:0] DO,
 	output       DTACK_N,
-	output       HL
+	output       HL,
+
+	// Savestate, see gen_io.
+	input  [1:0] SS_IO_ADDR,
+	input [31:0] SS_IO_WR_DATA,
+	input        SS_IO_WR_EN,
+	output [31:0] SS_IO_RD_DATA
 );
 
 wire [7:0] GEN_DO;

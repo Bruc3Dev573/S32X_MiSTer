@@ -26,6 +26,7 @@ SOFTWARE.*/
 
 module genesis_lpf(
 	input clk,
+	input ce,
 	input reset,
 	input [1:0] lpf_mode,
    input signed [15:0] in,
@@ -67,6 +68,7 @@ module genesis_lpf(
 	end
 	
 	iir_1st_order lpf6db(.clk(clk),
+								.ce(ce),
 								.reset(reset),
 								.div(div),
 								.A2(A2),
@@ -83,6 +85,7 @@ endmodule //genesis_lpf
 //The model 2 genesis has such a filter. The model 1 has only a global low-pass 
 module genesis_fm_lpf(
 	input clk,
+	input ce,
 	input reset,
    input signed [15:0] in,
    output signed [15:0] out);
@@ -90,6 +93,7 @@ module genesis_fm_lpf(
 	wire signed [15:0] middle;
 	 
 	iir_2nd_order fm2(.clk(clk),
+							.ce(ce),
 							.reset(reset),
 							.div(10'd504), //Divider for 106528hz
 							.A2(-18'sd24704),

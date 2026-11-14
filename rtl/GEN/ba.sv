@@ -80,6 +80,21 @@ module BA
 	input         ROM_DMA_DEC,
 	input         PAUSE_EN,
 	
+	// Savestate. Word 0: open bus latch. Word 1: refresh timers.
+	// BAR and the Z80 bus request/reset lines are restored by SS_EXT_SET.
+	// SS_HOLD is high while the 68000 is parked.
+	input         SS_HOLD,
+	input         SS_ADDR,
+	input  [31:0] SS_WR_DATA,
+	input         SS_WR_EN,
+	output [31:0] SS_RD_DATA,
+	output        SS_QUIET,
+	input         SS_EXT_SET,
+	input   [8:0] SS_BAR_DIR,
+	input   [1:0] SS_CTRL_DIR,     // {RESET_N, BUSRQ_N}
+	output  [8:0] SS_BAR,
+	output  [1:0] SS_CTRL,
+	
 	output reg [7:0] DBG_Z80_HOOK
 );
 
@@ -140,13 +155,12 @@ module BA
 					MBUS_ROM_REFRESH  = 13,
 					MBUS_RAM_REFRESH  = 14,
 					MBUS_FINISH       = 15; 
+	reg   [7:0] rfs_rom_timer, rfs_ram_timer;
+	reg         rfs_ram_pend, rfs_rom_pend;
+	reg   [1:0] rfs_rom_delay, rfs_ram_delay;
+	reg   [1:0] zbus_delay;
 	
 	always @(posedge CLK) begin
-		reg [7:0] rfs_rom_timer, rfs_ram_timer;
-		reg rfs_ram_pend, rfs_rom_pend;
-		reg [1:0] rfs_rom_delay, rfs_ram_delay;
-		reg [1:0] zbus_delay;
-		
 		if (!RST_N) begin
 			mstate <= MBUS_IDLE;
 			M68K_MBUS_DTACK_N <= 1;
@@ -166,7 +180,9 @@ module BA
 			OPEN_BUS <= 'h4E71;
 		end
 		else if (ENABLE) begin
-			if (M68K_CLKENp) begin
+			// The refresh timers stop with the 68000, so a resumed 68000 meets the same
+			// refresh wait states.
+			if (M68K_CLKENp && !SS_HOLD) begin
 				rfs_rom_timer <= rfs_rom_timer + 8'd1;
 				if (rfs_rom_timer == 8'd127) begin
 					rfs_rom_timer <= 0;
@@ -542,8 +558,19 @@ module BA
 					end
 				end
 			endcase;
+			
+			// Savestate restore. SS_WR_EN pulses only while frozen with the bus idle.
+			if (SS_WR_EN) begin
+				if (!SS_ADDR) OPEN_BUS <= SS_WR_DATA[15:0];
+				else {rfs_rom_timer, rfs_ram_timer, rfs_rom_pend, rfs_ram_pend,
+				      rfs_rom_delay, rfs_ram_delay, zbus_delay} <= SS_WR_DATA[23:0];
+			end
 		end
 	end
+	
+	assign SS_RD_DATA = !SS_ADDR ? {16'd0, OPEN_BUS} :
+	                    {8'd0, rfs_rom_timer, rfs_ram_timer, rfs_rom_pend, rfs_ram_pend,
+	                     rfs_rom_delay, rfs_ram_delay, zbus_delay};
 	
 	assign MBUS_DI = VDP_SEL ? (MBUS_A[4:2] == 3'b001 ? {OPEN_BUS[15:10],VDI[9:0]} : VDI) :
 	                 ZBUS_SEL ? (!Z80_BUSRQ_N ? {MBUS_ZBUS_D, MBUS_ZBUS_D} : OPEN_BUS) :
@@ -590,6 +617,10 @@ module BA
 			Z80_BUSRQ_N <= 1;
 			Z80_RESET_N <= 0;
 		end
+		else if (SS_EXT_SET) begin
+			Z80_BUSRQ_N <= SS_CTRL_DIR[0];
+			Z80_RESET_N <= SS_CTRL_DIR[1];
+		end
 		else if (ENABLE) begin
 			if (CTRL_SEL & ~MBUS_RNW & ~MBUS_UDS_N) begin
 				if (MBUS_A[11:8] == 1) Z80_BUSRQ_N <= ~MBUS_DO[8];
@@ -597,6 +628,7 @@ module BA
 			end
 		end
 	end
+	assign SS_CTRL = {Z80_RESET_N, Z80_BUSRQ_N};
 
 	// Z80:   0000-7EFF
 	// 68000: A00000-A07FFF (A08000-A0FFFF)
@@ -621,8 +653,9 @@ module BA
 	wire        Z80_MBUS_SEL = ~Z80_MREQ_N & Z80_RFSH_N & ~Z80_ZBUS_AREA;
 	wire  [7:0] Z80_MBUS_D = Z80_A[0] ? MBUS_DI[7:0] : MBUS_DI[15:8];
 	
+	reg [2:0] zstate, zstate2;
+	
 	always @(posedge CLK) begin
-		reg [2:0] zstate, zstate2;
 		reg Z80_BGACK_DIS, Z80_BGACK_DIS2;
 		reg Z80_WAIT_DELAY, Z80_AS_DELAY;
 	
@@ -804,8 +837,14 @@ module BA
 	reg [23:15] BAR;
 	always @(posedge CLK) begin
 		if (!RST_N) BAR <= 0;
+		else if (SS_EXT_SET) BAR <= SS_BAR_DIR;
 		else if (BANK_SEL & ZBUS_WE) BAR <= {ZBUS_DO[0], BAR[23:16]};
 	end
+	assign SS_BAR = BAR;
+	
+	// Nothing in flight on the 68000 bus, the Z bus or the Z80 bank access.
+	assign SS_QUIET = (mstate == MBUS_IDLE) && (zstate == 3'd0) && (zstate2 == 3'd0) &&
+	                  Z80_WAIT_N && M68K_MBUS_DTACK_N && Z80_MBUS_DTACK_N && VDP_MBUS_DTACK_N;
 	
 	// YM2612
 	// 4000-4003 (4000-5FFF)

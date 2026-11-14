@@ -1,6 +1,8 @@
 // M95320 SPI EEPROM support for Pier Solar, by Kitrinx
 // This module expects single-cycle bram. For longer delays the WIP reg
 // can be used to emulate the original eeprom's slow write times.
+// Savestates: ss_q holds the whole state; ss_we_hi loads ss_d[54:23] and ss_we_lo
+// loads ss_d[22:0]. WIP, SRWD, BP1 and BP0 are never set, so they are not in it.
 
 module STM95XXX
 (
@@ -17,7 +19,12 @@ module STM95XXX
 	output [11:0] ram_addr,      // RAM Address
 	input  [7:0]  ram_q,         // Data read from RAM
 	output [7:0]  ram_di,        // Data written to RAM
-	output        ram_we         // RAM read/write (write is high)
+	output        ram_we,        // RAM read/write (write is high)
+	// Savestate
+	input         ss_we_hi,
+	input         ss_we_lo,
+	input  [54:0] ss_d,
+	output [54:0] ss_q
 );
 
 assign ram_di = data_out;
@@ -25,7 +32,7 @@ assign ram_addr = address[11:0];
 assign ram_we = ram_write;
 assign so = bit_out;
 
-localparam ADDRESS_LEN = 32'hF;
+localparam ADDRESS_LEN = 5'hF;
 localparam ROM_SIZE = 'hFFF; // M95320 32k
 
 // SPI Commands
@@ -36,16 +43,16 @@ localparam WRDI  = 8'b0000_0100;
 localparam RDSR  = 8'b0000_0101;
 localparam WREN  = 8'b0000_0110;
 
-enum bit [2:0] {
-	M95_IDLE,
-	M95_WRSR,
-	M95_WRITE,
-	M95_READ,
-	M95_RDSR,
-	M95_WAIT
-} state;
+// States, a plain vector so a loaded state keeps its code.
+localparam [2:0] M95_IDLE  = 3'd0;
+localparam [2:0] M95_WRSR  = 3'd1;
+localparam [2:0] M95_WRITE = 3'd2;
+localparam [2:0] M95_READ  = 3'd3;
+localparam [2:0] M95_RDSR  = 3'd4;
+localparam [2:0] M95_WAIT  = 3'd5;
+logic [2:0] state;
 
-int bit_count;
+logic [4:0] bit_count;       // 0-7 in a command byte, up to 16 for the address
 
 logic [15:0] address;
 logic [7:0] data_in, data_out;
@@ -60,8 +67,13 @@ logic WEL; // write enable latch
 logic WIP; // write in progress
 logic SRWD, BP1, BP0; // Non-volatile block protect bits
 
+assign ss_q = {address, data_in, data_out, status, state, bit_count, byte_ptr, old_sck, bit_out, ram_write, WEL};
+
 always_ff @(posedge clk) begin
-	if (~enable || (~hold_n && cs_n)) begin
+	if (ss_we_hi | ss_we_lo) begin
+		if (ss_we_hi) {address, data_in, data_out} <= ss_d[54:23];
+		if (ss_we_lo) {status, state, bit_count, byte_ptr, old_sck, bit_out, ram_write, WEL} <= ss_d[22:0];
+	end else if (~enable || (~hold_n && cs_n)) begin
 		state <= M95_IDLE;
 		data_in <= 8'b0;
 		WIP <= 1'b0;

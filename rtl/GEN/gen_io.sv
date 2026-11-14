@@ -94,7 +94,13 @@ module gen_io
 	output reg       HL,
 
 	input            PAL,
-	input            EXPORT
+	input            EXPORT,
+
+	// Savestate: registers 0-15, four per word.
+	input      [1:0] SS_IO_ADDR,
+	input     [31:0] SS_IO_WR_DATA,
+	input            SS_IO_WR_EN,
+	output    [31:0] SS_IO_RD_DATA
 );
 
 reg  [7:0] R[16];
@@ -103,11 +109,16 @@ wire [7:0] DATB = R[2];
 wire [7:0] CTLA = R[4];
 wire [7:0] CTLB = R[5];
 
+assign SS_IO_RD_DATA = {R[{SS_IO_ADDR,2'd3}], R[{SS_IO_ADDR,2'd2}], R[{SS_IO_ADDR,2'd1}], R[{SS_IO_ADDR,2'd0}]};
+
 always @(posedge RESET or posedge CLK) begin
 	if(RESET) begin
 		DTACK_N <= 1;
 		DO <= 'hFF;
 		R  <= '{0, 'h7F,'h7F,'h7F, 0,0,0, 'hFF,0,0, 'hFF,0,0, 'hFF,0,0};
+	end
+	else if(SS_IO_WR_EN) begin
+		{R[{SS_IO_ADDR,2'd3}], R[{SS_IO_ADDR,2'd2}], R[{SS_IO_ADDR,2'd1}], R[{SS_IO_ADDR,2'd0}]} <= SS_IO_WR_DATA;
 	end
 	else if(CE) begin
 		if(~SEL) DTACK_N <= 1;

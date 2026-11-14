@@ -29,6 +29,7 @@ module iir_1st_order
 )
 (
 	input clk,
+	input ce,        // the filter holds its state while low
 	input reset,
 	input [COUNT_BITS - 1 : 0] div,
 	input signed [COEFF_WIDTH - 1 : 0] A2, B1, B2,
@@ -79,7 +80,7 @@ module iir_1st_order
 			x1 <= 0;
 			y0 <= 0;
 		end
-		else begin
+		else if (ce) begin
 			count <= count + 1'd1;
 			if (count == div - 1) begin
 					count <= 0;
@@ -101,6 +102,7 @@ module iir_2nd_order
 )
 (
 	input clk,
+	input ce,        // the filter holds its state while low
 	input reset,
 	input [COUNT_BITS - 1 : 0] div,
 	input signed [COEFF_WIDTH - 1 : 0] A2, A3, B1, B2, B3,
@@ -157,7 +159,7 @@ module iir_2nd_order
 			y0 <= 0;
 			y1 <= 0; 
 		end
-		else begin
+		else if (ce) begin
 			count <= count + 1'd1;
 			if (count == div - 1) begin
 					count <= 0;

@@ -134,6 +134,86 @@ module gen
 	input   [1:0] BG_GRID_EN,
 	input         SPR_GRID_EN,
 
+	// Savestate. SS_FREEZE asks the 68000 and the Z80 to park together at a safe point.
+	// SS_RELEASE is a one-clock pulse on the clock after the live raster and the 68000
+	// clock divider are back at their phase of the park (SS_DIV_OK): both CPUs run again
+	// from that clock (see the park clock P below).
+	// SS_EXT_CAN: the coprocessors outside gen (32X, SVP) can stop on this clock with
+	// nothing in flight. SS_ENGAGE is the clock the 68000 parks on (combinational): the
+	// 32X skips the SH-2 burst of that VCLK, so all of them stop on the same clock.
+	input         SS_FREEZE,
+	input         SS_RELEASE,
+	input         SS_EXT_CAN,
+	output        SS_ENGAGE,
+	output        SS_DIV_OK,
+	output        SS_M68K_FROZEN,
+	input   [7:0] SS_M68K_ADDR,
+	input  [15:0] SS_M68K_WR_DATA,
+	input         SS_M68K_WR_EN,
+	output [15:0] SS_M68K_RD_DATA,
+
+	// Memory stream. SS_ACTIVE hands the RAM ports over.
+	// SS_MEM_SEL: 0 = 68000 work RAM (16-bit words), 1 = VRAM (bytes), 2 = Z80 RAM (bytes).
+	input         SS_ACTIVE,
+	input   [1:0] SS_MEM_SEL,
+	input  [15:0] SS_MEM_ADDR,
+	input  [15:0] SS_MEM_WR_DATA,
+	input         SS_MEM_WR_EN,
+	output [15:0] SS_MEM_RD_DATA,
+
+	// VDP-internal stream (see vdp.sv).
+	input   [1:0] SS_VDP_SEL,
+	input   [7:0] SS_VDP_ADDR,
+	input  [31:0] SS_VDP_WR_DATA,
+	input         SS_VDP_WR_EN,
+	output [31:0] SS_VDP_RD_DATA,
+	output        SS_VDP_QUIET,
+	input         SS_VDP_PARK,
+	input         SS_VDP_RESUME,
+	output        SS_VDP_PHASE_OK,
+
+	// FM, region FM_SHADOW (see fm_savestate.sv).
+	input   [8:0] SS_FM_ADDR,
+	input  [31:0] SS_FM_WR_DATA,
+	input         SS_FM_WR_EN,
+	input         SS_FM_RD_EN,
+	output [31:0] SS_FM_RD_DATA,
+	output        SS_FM_READY,
+	input         SS_FM_REPLAY,
+	output        SS_FM_REPLAYING,
+
+	// Z80: the T80 registers, the HALT state, the bank register, the bus request and
+	// reset lines, and the rest of an instruction a bus request stopped.
+	output        SS_Z80_FROZEN,
+	output [211:0] SS_Z80_REG,
+	input  [211:0] SS_Z80_DIR,
+	input         SS_Z80_DIRSET,
+	output        SS_Z80_HALT,
+	input         SS_Z80_HALT_DIR,
+	output [119:0] SS_Z80_SEQ,
+	input  [119:0] SS_Z80_SEQ_DIR,
+	output  [8:0] SS_Z80_BAR,
+	input   [8:0] SS_Z80_BAR_DIR,
+	output  [1:0] SS_Z80_CTRL,      // {RESET_N, BUSRQ_N}
+	input   [1:0] SS_Z80_CTRL_DIR,
+	input         SS_Z80_EXT_SET,   // restore pulse for BAR and CTRL, before SS_Z80_DIRSET
+
+	// PSG registers.
+	input   [2:0] SS_PSG_ADDR,
+	input  [31:0] SS_PSG_WR_DATA,
+	input         SS_PSG_WR_EN,
+	output [31:0] SS_PSG_RD_DATA,
+
+	// Bus arbiter and I/O port registers.
+	// Words 0-3: I/O registers 0-15, four per word. Words 4-5: bus arbiter. Word 6: 68000
+	// divider phase at the park.
+	input   [2:0] SS_SYS_ADDR,
+	input  [31:0] SS_SYS_WR_DATA,
+	input         SS_SYS_WR_EN,
+	output [31:0] SS_SYS_RD_DATA,
+	output        SS_BA_QUIET,
+
+
 	output [23:0] DBG_M68K_A,
 	output [23:0] DBG_VA_A
 );
@@ -147,12 +227,12 @@ end
 //--------------------------------------------------------------
 // CLOCK ENABLERS
 //--------------------------------------------------------------
-wire M68K_CLKEN = M68K_CLKENp;
 reg  M68K_CLKENp, M68K_CLKENn;
 reg  Z80_CLKENp, Z80_CLKENn;
 
+// VCLKCNT is visible to the savestate logic, which restores its phase against the raster.
+reg [3:0] VCLKCNT = 0;
 always @(negedge MCLK) begin
-	reg [3:0] VCLKCNT = 0;
 	reg [3:0] ZCLKCNT = 0;
 
 	if(~RESET_N | LOADING) begin
@@ -211,14 +291,64 @@ wire        M68K_BR_N;
 wire        M68K_BGACK_N;
 reg   [2:0] M68K_IPL_N;
 wire        M68K_INTACK = &M68K_FC & ~M68K_AS_N;
+wire        M68K_BUS_STARTING;
+
+// The 68000 and the Z80 park together, on one clock where both are at a safe point
+// (see the Z80 section): the 68000 at bus idle or reset, never at a newly starting
+// cycle, on an enPhi2 clock, with no bus request and an idle VDP, so no DMA asks for
+// the bus after the park. Parking both at once (and the 32X and SVP with them, see
+// SS_ENGAGE) means no CPU runs while another is held, so none sees another stall.
+wire ss_m68k_pulse = M68K_CLKENp | M68K_CLKENn;
+wire ss_m68k_bus_req = ~M68K_BR_N | ~M68K_BGACK_N;
+wire ss_m68k_can = (M68K_AS_N && !M68K_BUS_STARTING && !ss_m68k_bus_req && SS_VDP_QUIET) || reset;
+reg  ss_m68k_freeze_eng = 0;
+reg  ss_m68k_last_p = 0;
+always @(posedge MCLK) begin
+	// Phase of the last pulse on the ungated stream, which keeps alternating while
+	// the gate is engaged.
+	if(M68K_CLKENp)      ss_m68k_last_p <= 1;
+	else if(M68K_CLKENn) ss_m68k_last_p <= 0;
+end
+assign SS_M68K_FROZEN = ss_m68k_freeze_eng;
+
+// The park clock P is the SS_ENGAGE clock, where the VDP latches its raster position
+// (SS_VDP_PARK rises) and the 32X skips its SH-2 burst. The divider phase there is kept
+// with it, and a load restores both. The divider runs on while the 68000 is parked; a
+// frame is not a multiple of its 7 clocks, so the release waits for a frame where the
+// divider is back at the parked phase. On that clock the 32X starts the burst it
+// skipped; the 68000 had already taken its enPhi2 pulse of P, so SS_RELEASE comes one
+// clock later (the top registers it), which gives the 68000 the same enable pulses it
+// would have had. VCLKCNT steps on the falling edge, so the phase is compared on a
+// rising-edge copy: SS_RELEASE must hold for the whole clock, or logic on the falling
+// edge would see a release the rising-edge logic does not.
+reg  [3:0] ss_vclk_q = 0;
+reg  [3:0] ss_vclk_park = 0;
+always @(posedge MCLK) begin
+	ss_vclk_q <= VCLKCNT;
+	if(SS_ENGAGE) ss_vclk_park <= ss_vclk_q;
+	if(SS_SYS_WR_EN && SS_SYS_ADDR == 3'd6) ss_vclk_park <= SS_SYS_WR_DATA[3:0];
+end
+assign SS_DIV_OK = (ss_vclk_q == ss_vclk_park);
+
+wire ss_m68k_gate  = ss_m68k_freeze_eng & ~SS_RELEASE;
+wire M68K_CLKENp_G = M68K_CLKENp & ~ss_m68k_gate;
+wire M68K_CLKENn_G = M68K_CLKENn & ~ss_m68k_gate;
 
 fx68k M68K
 (
 	.clk(MCLK),
 	.extReset(reset),
 	.pwrUp(reset),
-	.enPhi1(M68K_CLKENp),
-	.enPhi2(M68K_CLKENn),
+	.enPhi1(M68K_CLKENp_G),
+	.enPhi2(M68K_CLKENn_G),
+
+	.addrOe_o(),
+	.dataOe_o(),
+	.busStarting_o(M68K_BUS_STARTING),
+	.ss_addr(SS_M68K_ADDR),
+	.ss_wr_data(SS_M68K_WR_DATA),
+	.ss_wr_en(SS_M68K_WR_EN),
+	.ss_rd_data(SS_M68K_RD_DATA),
 
 	.eRWn(M68K_RNW),
 	.ASn(M68K_AS_N),
@@ -267,6 +397,13 @@ CODES #(.ADDR_WIDTH(24), .DATA_WIDTH(16)) codes (
 wire [15:0] WRAM_Q;
 wire        RAM_N;
 
+// Port B only clears the RAM while LOADING, so the stream borrows it while frozen.
+wire        ss_wram_sel = SS_ACTIVE & (SS_MEM_SEL == 2'd0);
+wire [15:1] wram_b_a    = ss_wram_sel ? SS_MEM_ADDR[14:0] : ram_rst_a[15:1];
+wire        wram_b_we   = ss_wram_sel ? SS_MEM_WR_EN : LOADING;
+wire [15:0] wram_b_d    = ss_wram_sel ? SS_MEM_WR_DATA : 16'd0;
+wire [15:0] wram_b_q;
+
 dpram #(15) ram68k_u
 (
 	.clock(MCLK),
@@ -275,8 +412,10 @@ dpram #(15) ram68k_u
 	.wren_a(~RAM_N & ~RNW & ~UDS_N),
 	.q_a(WRAM_Q[15:8]),
 
-	.address_b(ram_rst_a[15:1]),
-	.wren_b(LOADING)
+	.address_b(wram_b_a),
+	.data_b(wram_b_d[15:8]),
+	.wren_b(wram_b_we),
+	.q_b(wram_b_q[15:8])
 );
 
 dpram #(15) ram68k_l
@@ -287,8 +426,10 @@ dpram #(15) ram68k_l
 	.wren_a(~RAM_N & ~RNW & ~LDS_N),
 	.q_a(WRAM_Q[7:0]),
 
-	.address_b(ram_rst_a[15:1]),
-	.wren_b(LOADING)
+	.address_b(wram_b_a),
+	.data_b(wram_b_d[7:0]),
+	.wren_b(wram_b_we),
+	.q_b(wram_b_q[7:0])
 );
 
 
@@ -315,13 +456,60 @@ wire        ZWR_N;
 wire        ZRD_N;
 wire        ZRAM_N;
 
+// Capture the Z80 state between two instructions (T2 of the opcode fetch of a new one,
+// see InstBound in T80), in reset, or with the bus given to the 68000, where T80 stops at
+// the end of any machine cycle and SEQ holds the rest of the instruction.
+// A DIRSet resumes T2 of the fetch, or with SEQ_DIR the instruction the bus request
+// stopped.
+wire Z80_M1_N;
+wire Z80_HALT_N;
+wire Z80_INST_BOUND;
+// Engage at an edge without Z80_CLKENp: at an edge with it, T80 leaves the state the
+// condition shows (T2 of the fetch, or BUSAK when the bus request has ended) while the
+// freeze takes effect only at the next edge.
+wire ss_z80_can = ~Z80_RESET_N || ((Z80_INST_BOUND || ~Z80_BUSAK_N) && ~Z80_CLKENp);
+
+// Both CPUs park on an enPhi2 clock (the VCLK on which the 32X starts its SH-2 bursts)
+// where the Z80 and the coprocessors outside gen can park too, and are released together
+// by SS_RELEASE. The enPhi2 pulse of that clock still reaches the 68000 (the gate is
+// registered), so it parks in the state after enPhi2, as it did on the pulse-free edge
+// that follows. That is the state the conditions show: fx68k (busControl) starts a bus
+// phase and drops AS only on enPhi1, so AS high and no S0 before the pulse still hold
+// after it. A bus request is let through until the capture is granted; after a park
+// none can come, as both CPUs are held and the VDP is idle.
+assign SS_ENGAGE = SS_FREEZE & ~ss_m68k_freeze_eng & ~SS_RELEASE & M68K_CLKENn &
+                   ss_m68k_can & ss_z80_can & SS_EXT_CAN;
+always @(posedge MCLK) begin
+	if(SS_RELEASE) ss_m68k_freeze_eng <= 0;
+	else if(SS_ENGAGE) ss_m68k_freeze_eng <= 1;
+	else if(!ss_m68k_pulse && !ss_m68k_last_p) begin
+		if(!SS_FREEZE)                                   ss_m68k_freeze_eng <= 0;
+		else if(!SS_ACTIVE && ss_m68k_bus_req && !reset) ss_m68k_freeze_eng <= 0;
+	end
+end
+wire ss_z80_freeze_eng = ss_m68k_freeze_eng;
+assign SS_Z80_FROZEN = ss_z80_freeze_eng;
+assign SS_Z80_HALT = ~Z80_HALT_N;
+
+wire Z80_CLKENp_G = Z80_CLKENp & ~ss_m68k_gate;
+wire Z80_CLKENn_G = Z80_CLKENn & ~ss_m68k_gate;
+
 //T80s #(.T2Write(1)) Z80
 T80pa Z80
 (
 	.RESET_n(Z80_RESET_N),
 	.CLK(MCLK),
-	.CEN_p(Z80_CLKENp),
-	.CEN_n(Z80_CLKENn),
+	.CEN_p(Z80_CLKENp_G),
+	.CEN_n(Z80_CLKENn_G),
+	.M1_n(Z80_M1_N),
+	.HALT_n(Z80_HALT_N),
+	.REG(SS_Z80_REG),
+	.InstBound(Z80_INST_BOUND),
+	.SEQ(SS_Z80_SEQ),
+	.DIRSet(SS_Z80_DIRSET),
+	.DIR(SS_Z80_DIR),
+	.DIRHalt(SS_Z80_HALT_DIR),
+	.DIRSeq(SS_Z80_SEQ_DIR),
 //	.CEN(Z80_CLKENn),
 	.BUSRQ_n(Z80_BUSRQ_N),
 	.BUSAK_n(Z80_BUSAK_N),
@@ -337,14 +525,22 @@ T80pa Z80
 	.DO(Z80_DO)
 );
 
+// Z80 RAM port B is unused, so the stream takes it.
+wire        ss_zram_sel = SS_ACTIVE & (SS_MEM_SEL == 2'd2);
 wire  [7:0] ZRAM_DO;
+wire  [7:0] zram_b_q;
 dpram #(13) ramZ80
 (
 	.clock(MCLK),
 	.address_a(ZA[12:0]),
 	.data_a(ZDO),
 	.wren_a(~ZWR_N & ~ZRAM_N),
-	.q_a(ZRAM_DO)
+	.q_a(ZRAM_DO),
+
+	.address_b(SS_MEM_ADDR[12:0]),
+	.data_b(SS_MEM_WR_DATA[7:0]),
+	.wren_b(ss_zram_sel & SS_MEM_WR_EN),
+	.q_b(zram_b_q)
 );
 
 
@@ -373,6 +569,8 @@ wire        IO_DTACK_N;
 wire        HL;
 
 wire        VDP_DTACK_N;
+
+wire [31:0] ss_ba_rd_data;
 
 BA ba
 (
@@ -453,7 +651,19 @@ BA ba
 	
 	.MEM_RDY(MEM_RDY),
 	.ROM_DMA_DEC(ROM_DMA_DEC),
-	.PAUSE_EN(PAUSE_EN)
+	.PAUSE_EN(PAUSE_EN),
+
+	.SS_HOLD(ss_m68k_gate),
+	.SS_ADDR(SS_SYS_ADDR[0]),
+	.SS_WR_DATA(SS_SYS_WR_DATA),
+	.SS_WR_EN(SS_SYS_WR_EN & (SS_SYS_ADDR[2:1] == 2'b10)),
+	.SS_RD_DATA(ss_ba_rd_data),
+	.SS_QUIET(SS_BA_QUIET),
+	.SS_EXT_SET(SS_Z80_EXT_SET),
+	.SS_BAR_DIR(SS_Z80_BAR_DIR),
+	.SS_CTRL_DIR(SS_Z80_CTRL_DIR),
+	.SS_BAR(SS_Z80_BAR),
+	.SS_CTRL(SS_Z80_CTRL)
 );
 
 assign BA_DI = !RAM_N ? WRAM_Q :
@@ -548,9 +758,23 @@ VDP vdp
 	.BGB_EN(BGB_EN),
 	.SPR_EN(SPR_EN),
 	.BG_GRID_EN(BG_GRID_EN),
-	.SPR_GRID_EN(SPR_GRID_EN)
+	.SPR_GRID_EN(SPR_GRID_EN),
+
+	.SS_ACTIVE(SS_ACTIVE),
+	.SS_SEL(SS_VDP_SEL),
+	.SS_ADDR(SS_VDP_ADDR),
+	.SS_WR_DATA(SS_VDP_WR_DATA),
+	.SS_WR_EN(SS_VDP_WR_EN),
+	.SS_RD_DATA(SS_VDP_RD_DATA),
+	.SS_QUIET(SS_VDP_QUIET),
+	.SS_PARK(SS_VDP_PARK),
+	.SS_RESUME(SS_VDP_RESUME),
+	.SS_PHASE_OK(SS_VDP_PHASE_OK)
 );
 
+// Port B only clears VRAM while LOADING, so the stream borrows it while frozen.
+wire        ss_vram_sel = SS_ACTIVE & (SS_MEM_SEL == 2'd1);
+wire  [7:0] vram_b_q;
 dpram #(16,8) vram
 (
 	.clock(MCLK),
@@ -559,18 +783,30 @@ dpram #(16,8) vram
 	.wren_a(vram_we),
 	.q_a(vram_q),
 
-	.address_b(ram_rst_a[16:1]),
-	.wren_b(LOADING)
+	.address_b(ss_vram_sel ? SS_MEM_ADDR : ram_rst_a[16:1]),
+	.data_b(ss_vram_sel ? SS_MEM_WR_DATA[7:0] : 8'd0),
+	.wren_b(ss_vram_sel ? SS_MEM_WR_EN : LOADING),
+	.q_b(vram_b_q)
 );
+
+assign SS_MEM_RD_DATA = (SS_MEM_SEL == 2'd0) ? wram_b_q :
+                        (SS_MEM_SEL == 2'd1) ? {8'd0, vram_b_q} :
+                                               {8'd0, zram_b_q};
 
 
 // PSG 0x10-0x17 in VDP space
 wire signed [10:0] PSG_SND;
 jt89 psg
 (
+	.ss_addr(SS_PSG_ADDR),
+	.ss_wr_data(SS_PSG_WR_DATA),
+	.ss_wr_en(SS_PSG_WR_EN),
+	.ss_rd_data(SS_PSG_RD_DATA),
+
 	.rst(reset),
 	.clk(MCLK),
-	.clk_en(Z80_CLKENn),
+	// The PSG stops with the CPUs, so it skips exactly the clocks they skip.
+	.clk_en(Z80_CLKENn & ~ss_m68k_gate),
 
 	.wr_n(RNW | VDP_N | ~VA[4] | VA[3]),
 	.din(VDO[15:8]),
@@ -583,11 +819,14 @@ jt89 psg
 // Gamepads
 //--------------------------------------------------------------
 
+wire [31:0] ss_io_rd_data;
+
 multitap multitap
 (
 	.RESET(reset),
 	.CLK(MCLK),
-	.CE(M68K_CLKEN),
+	// The pad timers stop with the 68000, which is the only one reading the ports.
+	.CE(M68K_CLKENp_G),
 
 	.J3BUT(J3BUT),
 
@@ -685,8 +924,17 @@ multitap multitap
 	.DI(VDO[7:0]),
 	.DO(IO_DO),
 	.DTACK_N(IO_DTACK_N),
-	.HL(HL)
+	.HL(HL),
+
+	.SS_IO_ADDR(SS_SYS_ADDR[1:0]),
+	.SS_IO_WR_DATA(SS_SYS_WR_DATA),
+	.SS_IO_WR_EN(SS_SYS_WR_EN & ~SS_SYS_ADDR[2]),
+	.SS_IO_RD_DATA(ss_io_rd_data)
 );
+
+// Word 6: the 68000 divider phase at the park.
+assign SS_SYS_RD_DATA = (SS_SYS_ADDR == 3'd6)  ? {28'd0, ss_vclk_park} :
+                        SS_SYS_ADDR[2]         ? ss_ba_rd_data : ss_io_rd_data;
 
 
 //--------------------------------------------------------------
@@ -702,22 +950,41 @@ wire [15:0] SR;
 wire signed [15:0] PRE_LPF_L;
 wire signed [15:0] PRE_LPF_R;
 
-jt12 fm
+// The chip stops while the CPUs that write it are parked and during the stream.
+fm_savestate fm
 (
-	.rst(~Z80_RESET_N),
 	.clk(MCLK),
 	.cen(M68K_CLKENp),
+	.rst(~Z80_RESET_N),
 
-	.cs_n(0),
+	.sel(~YM_N),
 	.addr(ZA[1:0]),
-	.wr_n(YM_N | ZWR_N),
+	.we(~ZWR_N),
 	.din(ZDO),
 	.dout(FM_DO),
+
 	.en_hifi_pcm(EN_HIFI_PCM),
 	.ladder(LADDER),
 	.snd_left(FM_left),
-	.snd_right(FM_right)
+	.snd_right(FM_right),
+
+	// Held from the park to the release, a whole number of frames apart.
+	.ss_park(SS_ACTIVE | ss_m68k_gate),
+	.ss_active(SS_ACTIVE),
+	.ss_addr(SS_FM_ADDR),
+	.ss_wr_data(SS_FM_WR_DATA),
+	.ss_wr_en(SS_FM_WR_EN),
+	.ss_rd_en(SS_FM_RD_EN),
+	.ss_rd_data(SS_FM_RD_DATA),
+	.ss_ready(SS_FM_READY),
+	.ss_replay(SS_FM_REPLAY),
+	.ss_replaying(SS_FM_REPLAYING)
 );
+
+// The audio chain below pauses with the CPUs (ss_m68k_gate), from the park to the
+// release, so it neither sees the chip outputs move while the state streams nor runs
+// on through the pause: after a resume it continues exactly where it stopped.
+wire ss_audio_ce = ~ss_m68k_gate;
 
 wire signed [15:0] fm_adjust_l = (FM_left << 4) + (FM_left << 2) + (FM_left << 1) + (FM_left >>> 2);
 wire signed [15:0] fm_adjust_r = (FM_right << 4) + (FM_right << 2) + (FM_right << 1) + (FM_right >>> 2);
@@ -725,6 +992,7 @@ wire signed [15:0] fm_adjust_r = (FM_right << 4) + (FM_right << 2) + (FM_right <
 genesis_fm_lpf fm_lpf_l
 (
 	.clk(MCLK),
+	.ce(ss_audio_ce),
 	.reset(reset),
 	.in(fm_adjust_l),
 	.out(FM_LPF_left)
@@ -733,6 +1001,7 @@ genesis_fm_lpf fm_lpf_l
 genesis_fm_lpf fm_lpf_r
 (
 	.clk(MCLK),
+	.ce(ss_audio_ce),
 	.reset(reset),
 	.in(fm_adjust_r),
 	.out(FM_LPF_right)
@@ -747,6 +1016,7 @@ jt12_genmix genmix
 (
 	.rst(reset),
 	.clk(MCLK),
+	.ce(ss_audio_ce),
 	.fm_left(fm_select_l),
 	.fm_right(fm_select_r),
 	.psg_snd(psg_adjust),
@@ -773,6 +1043,7 @@ SND_MIX mix
 genesis_lpf lpf_right
 (
 	.clk(MCLK),
+	.ce(ss_audio_ce),
 	.reset(reset),
 	.lpf_mode(LPF_MODE[1:0]),
 	.in(PRE_LPF_R),
@@ -782,6 +1053,7 @@ genesis_lpf lpf_right
 genesis_lpf lpf_left
 (
 	.clk(MCLK),
+	.ce(ss_audio_ce),
 	.reset(reset),
 	.lpf_mode(LPF_MODE[1:0]),
 	.in(PRE_LPF_L),

@@ -77,7 +77,20 @@ module VDP
 	output [15:0] DBG_FIFO_DATA,
 	output  [3:0] DBG_FIFO_CODE,
 	output        DBG_FIFO_EMPTY,
-	output        DBG_FIFO_FULL 
+	output        DBG_FIFO_FULL,
+
+	//Savestate. The stream owns the CRAM/VSRAM IO ports and the sprite attribute
+	//cache while SS_ACTIVE. See the SS word map near the end of this module.
+	input             SS_ACTIVE,	// freeze granted (after SS_QUIET)
+	input       [1:0] SS_SEL,		// 0 CRAM, 1 VSRAM, 2 sprite attribute cache, 3 registers
+	input       [7:0] SS_ADDR,
+	input      [31:0] SS_WR_DATA,
+	input             SS_WR_EN,
+	output reg [31:0] SS_RD_DATA,	// 2 clocks after SS_SEL/SS_ADDR
+	output reg        SS_QUIET,		// CPU side idle: FIFO empty, no DMA running, no transfer pending
+	input             SS_PARK,		// high from the CPU park through the stream and the resume hold
+	input             SS_RESUME,		// 1 clock pulse at CPU release
+	output            SS_PHASE_OK	// live raster reached the parked/restored position
 );
 	import VDP_PKG::*;
 	
@@ -188,6 +201,21 @@ module VDP
 	bit        SCOL_FLAG;
 	bit        SOVR_FLAG_CLR;
 	bit        SCOL_FLAG_CLR;
+	
+	bit        HINT_EN;
+	bit  [7:0] HINT_COUNT;
+	bit [11:0] Z80_INT_WAIT;
+	
+	//Savestate
+	localparam SS_RESUME_LAG = 1;	// clocks from the SS_PHASE_OK clock to the SS_RESUME clock
+	wire        SS_WE = SS_ACTIVE & SS_WR_EN;
+	wire        SS_REG_WE = SS_WE && SS_SEL == 2'd3;
+	wire        SS_CRAM_SEL = SS_ACTIVE && SS_SEL == 2'd0;
+	wire        SS_VSRAM_SEL = SS_ACTIVE && SS_SEL == 2'd1;
+	wire        SS_OBJC_SEL = SS_ACTIVE && SS_SEL == 2'd2;
+	bit  [31:0] SS_PARK_IRQ;	// word 09, applied at SS_RESUME
+	bit  [22:0] SS_PARK_POS;	// word 0A, compared by SS_PHASE_OK
+	bit  [15:0] SS_PARK_HV;	// word 0B, applied at SS_RESUME
 	
 	
 	//IO
@@ -685,6 +713,64 @@ module VDP
 				FIFO.AMOUNT <= FIFO.AMOUNT + 3'd1;
 			else if (FIFO_AMOUNT_DEC && !FIFO_AMOUNT_INC)
 				FIFO.AMOUNT <= FIFO.AMOUNT - 3'd1;
+			
+			//Savestate restore (SEL 3). Last in the process so it takes priority. Writes only
+			//happen while SS_ACTIVE, which the top grants after SS_QUIET, so the FSMs are idle.
+			if (SS_REG_WE) begin
+				case (SS_ADDR)
+					8'h00: begin
+						MR1 <= SS_WR_DATA[7:0] & MR1_MASK;
+						MR2 <= SS_WR_DATA[15:8] & MR2_MASK;
+						NTA <= SS_WR_DATA[23:16] & NTA_MASK;
+						NTW <= SS_WR_DATA[31:24] & NTW_MASK;
+					end
+					8'h01: begin
+						NTB <= SS_WR_DATA[7:0] & NTB_MASK;
+						SAT <= SS_WR_DATA[15:8] & SAT_MASK;
+						BGC <= SS_WR_DATA[31:24] & BGC_MASK;
+					end
+					8'h02: begin
+						HIR <= SS_WR_DATA[23:16] & HIR_MASK;
+						MR3 <= SS_WR_DATA[31:24] & MR3_MASK;
+					end
+					8'h03: begin
+						MR4 <= SS_WR_DATA[7:0] & MR4_MASK;
+						NSDT <= SS_WR_DATA[15:8] & NSDT_MASK;
+						AI <= SS_WR_DATA[31:24] & AI_MASK;
+					end
+					8'h04: begin
+						SS <= SS_WR_DATA[7:0] & SS_MASK;
+						WHP <= SS_WR_DATA[15:8] & WHP_MASK;
+						WVP <= SS_WR_DATA[23:16] & WVP_MASK;
+						DLC[7:0] <= SS_WR_DATA[31:24];
+					end
+					8'h05: begin
+						DLC[15:8] <= SS_WR_DATA[7:0];
+						DSA <= SS_WR_DATA[31:8];
+					end
+					8'h06: begin
+						ADDR <= SS_WR_DATA[16:0];
+						CODE <= SS_WR_DATA[22:17];
+						PENDING <= SS_WR_DATA[23];
+						FIFO.RD_POS <= SS_WR_DATA[25:24];
+						FIFO.WR_POS <= SS_WR_DATA[27:26];
+						FIFO.AMOUNT <= SS_WR_DATA[30:28];
+						DMA_FILL <= SS_WR_DATA[31];
+					end
+					8'h07: DBG <= SS_WR_DATA[15:0];
+					8'h08: begin
+						DT_RD_DATA <= SS_WR_DATA[15:0];
+						DT_RD_CODE <= SS_WR_DATA[19:16];
+						DMA_FILL_CODE <= SS_WR_DATA[23:20];
+					end
+					8'h10, 8'h12, 8'h14, 8'h16: begin
+						FIFO.ITEMS[SS_ADDR[2:1]].ADDR <= SS_WR_DATA[16:0];
+						FIFO.ITEMS[SS_ADDR[2:1]].CODE <= SS_WR_DATA[20:17];
+					end
+					8'h11, 8'h13, 8'h15, 8'h17: FIFO.ITEMS[SS_ADDR[2:1]].DATA <= SS_WR_DATA[15:0];
+					default:;
+				endcase
+			end
 		end
 	end
 	
@@ -698,6 +784,9 @@ module VDP
 					OPEN_BUS <= DI;
 				else
 					OPEN_BUS <= DO;
+			end
+			if (SS_REG_WE && SS_ADDR == 8'h07) begin
+				OPEN_BUS <= SS_WR_DATA[31:16];
 			end
 		end
 	end
@@ -733,10 +822,10 @@ module VDP
 	vdp_cram CRAM
 	(
 		.clock(CLK),
-		.data_b(CRAM_D),
+		.data_b(SS_CRAM_SEL ? SS_WR_DATA[8:0] : CRAM_D),
 		.address_a(CRAM_ADDR_A),
-		.address_b(CRAM_ADDR_B),
-		.wren_b(CRAM_WE),
+		.address_b(SS_CRAM_SEL ? SS_ADDR[5:0] : CRAM_ADDR_B),
+		.wren_b(SS_CRAM_SEL ? SS_WE : CRAM_WE),
 		.q_a(CRAM_Q_A),
 		.q_b(CRAM_Q_B)
 	);
@@ -751,10 +840,10 @@ module VDP
 	vdp_vsram VSRAM
 	(
 		.clock(CLK),
-		.data_b(VSRAM_D),
+		.data_b(SS_VSRAM_SEL ? SS_WR_DATA[10:0] : VSRAM_D),
 		.address_a(VSRAM_ADDR_A),
-		.address_b(VSRAM_ADDR_B),
-		.wren_b(VSRAM_WE),
+		.address_b(SS_VSRAM_SEL ? SS_ADDR[5:0] : VSRAM_ADDR_B),
+		.wren_b(SS_VSRAM_SEL ? SS_WE : VSRAM_WE),
 		.q_a(VSRAM_Q_A),
 		.q_b(VSRAM_Q_B)
 	);
@@ -1353,11 +1442,11 @@ module VDP
 	obj_cache OBJ_CACHE
 	(
 		.clock(CLK),
-		.wraddress(OBJC_ADDR_WR),
-		.data(OBJC_D),
-		.wren(OBJC_WE),
-		.byteena_a(OBJC_BE),
-		.rdaddress(OBJC_ADDR_RD),
+		.wraddress(SS_OBJC_SEL ? SS_ADDR[6:0] : OBJC_ADDR_WR),
+		.data(SS_OBJC_SEL ? SS_WR_DATA : OBJC_D),
+		.wren(SS_OBJC_SEL ? SS_WE : OBJC_WE),
+		.byteena_a(SS_OBJC_SEL ? 4'b1111 : OBJC_BE),
+		.rdaddress(SS_OBJC_SEL ? SS_ADDR[6:0] : OBJC_ADDR_RD),
 		.q(OBJC_Q)
 	);
 	
@@ -1665,6 +1754,11 @@ module VDP
 				else if (SOVR_FLAG_CLR)
 					SOVR_FLAG <= 0;
 			end
+			
+			if (SS_RESUME) begin
+				SOVR_FLAG <= SS_PARK_IRQ[24];
+				SCOL_FLAG <= SS_PARK_IRQ[25];
+			end
 		end
 	end
 
@@ -1915,14 +2009,15 @@ module VDP
 //					EXINT_PENDING_SET <= 1;
 				end
 			end
+			
+			if (SS_RESUME) begin
+				HV <= SS_PARK_HV;
+			end
 		end
 	end
 	
 	always @(posedge CLK or negedge RST_N) begin
-		bit        HINT_EN;
-		bit  [7:0] HINT_COUNT;
 		bit        INTACK_N_OLD;
-		bit [11:0] Z80_INT_WAIT;
 		
 		if (!RST_N) begin
 			VINT_FLAG <= 0;
@@ -1975,6 +2070,17 @@ module VDP
 					Z80_INT_WAIT <= Z80_INT_WAIT - 12'd1;
 				end
 			end
+			
+			//Savestate: the pending flags and the HINT countdown as they were when the CPUs
+			//parked. Anything raised while they were held is dropped.
+			if (SS_RESUME) begin
+				HINT_COUNT <= SS_PARK_IRQ[7:0];
+				HINT_EN <= SS_PARK_IRQ[8];
+				HINT_FLAG <= SS_PARK_IRQ[9];
+				VINT_FLAG <= SS_PARK_IRQ[10];
+				Z80_INT_FLAG <= SS_PARK_IRQ[11];
+				Z80_INT_WAIT <= SS_PARK_IRQ[23:12];
+			end
 		end
 	end
 	
@@ -1998,10 +2104,156 @@ module VDP
 						IPL_N <= 2'b11;
 				end
 			end
+			
+			if (SS_RESUME) begin
+				IPL_N <= SS_PARK_IRQ[27:26];
+			end
 		end
 	end
 	
 	assign Z80_INT_N = ~Z80_INT_FLAG;
+	
+	//--------------------------------------------------------------
+	// Savestate
+	//--------------------------------------------------------------
+	// Regions (32-bit words, narrower data zero-extended):
+	//   SEL 0  CRAM               64 words, [8:0] = {B,G,R} as stored (3 bits each)
+	//   SEL 1  VSRAM              64 words, [10:0]; the whole physical 64x11 array, not only
+	//                             the 40 entries the CPU can address
+	//   SEL 2  sprite attr cache 128 words, [31:0] = cached SAT bytes 0-3 of each entry
+	//   SEL 3  registers          32 words, map below; unlisted words read 0, writes ignored
+	// CRAM and VSRAM use their CPU-side port B and the cache its write port, which are idle
+	// once SS_QUIET. The cache read port is shared with the sprite engine, so sprites may
+	// glitch while SEL 2 streams. Per-line state (sprite lists, line buffer, tile pipeline,
+	// scroll and window latches) is rebuilt by the running raster and not stored. VRAM is
+	// external to this module.
+	//
+	// SEL 3 word map. Byte k of words 00-05 is VDP register 4*w+k (masked as on a CPU write;
+	// the unimplemented registers 6, 8, 9, 14 read 0):
+	//   00  [7:0] R0 MR1     [15:8] R1 MR2      [23:16] R2 NTA       [31:24] R3 NTW
+	//   01  [7:0] R4 NTB     [15:8] R5 SAT      [23:16] -            [31:24] R7 BGC
+	//   02  [7:0] -          [15:8] -           [23:16] R10 HIR      [31:24] R11 MR3
+	//   03  [7:0] R12 MR4    [15:8] R13 NSDT    [23:16] -            [31:24] R15 AI
+	//   04  [7:0] R16 SS     [15:8] R17 WHP     [23:16] R18 WVP      [31:24] R19 DMA length low
+	//   05  [7:0] R20 DMA length high           [31:8] R21-R23 DMA source/mode
+	//   06  [16:0] ADDR  [22:17] CODE  [23] PENDING (first control word seen)
+	//       [25:24] FIFO RD_POS  [27:26] FIFO WR_POS  [30:28] FIFO AMOUNT  [31] DMA_FILL (armed)
+	//   07  [15:0] DBG (debug register)  [31:16] OPEN_BUS
+	//   08  [15:0] DT_RD_DATA (data port read buffer)  [19:16] DT_RD_CODE  [23:20] DMA_FILL_CODE
+	//   09  park: [7:0] HINT_COUNT  [8] HINT_EN  [9] HINT_FLAG  [10] VINT_FLAG  [11] Z80_INT_FLAG
+	//       [23:12] Z80_INT_WAIT  [24] SOVR_FLAG  [25] SCOL_FLAG  [27:26] IPL_N
+	//   0A  park: [8:0] H_CNT  [17:9] V_CNT  [18] FIELD  [22:19] MCLK within the dot (SS_SUBPIX)
+	//   0B  park: [15:0] HV (H/V counter as the CPU reads it, latched or live)
+	//   10+2i  FIFO entry i: [16:0] ADDR  [20:17] CODE     (i = 0..3)
+	//   11+2i  FIFO entry i: [15:0] DATA
+	// The FIFO is empty at capture, but entries are stored because a VRAM read takes the
+	// unused byte of its result from the entry at RD_POS.
+	//
+	// Words 09-0B are park words. The CPUs stop at the SS_PARK rise (clock P). The position
+	// is latched from clock P, the flags and HV from clock P+1+SS_RESUME_LAG. While SS_PARK is
+	// high they read the latch, and a load writes the latch; the live flags, counters and
+	// field are never written by a load. SS_PHASE_OK goes high for one clock when the live
+	// raster is back at the latched position, and SS_RESUME (SS_RESUME_LAG clocks later)
+	// applies the latched flags, so the VDP continues as if it had never been held.
+	//
+	// Not stored, by construction idle at SS_QUIET: DTC/DMAC state, DT_RD_PEND/EXEC,
+	// DMA_FILL_START/WE, DMA_COPY(_WE), DMA_VBUS, bus request/grant/DTACK flops, IO_ADDR/
+	// IO_DATA/IO_BYTE/IO_WE (always reloaded before use). Not stored, raster/sync state that a
+	// load must not move: dot clock dividers, H/V counters, FIELD, FIELD_LATCH, sync and blank
+	// flops, V30 latch, display enable delay. INTACK_N_OLD and HL_OLD sample live inputs.
+	
+	// MCLK count since the last dot clock, so the resume lands on the same MCLK as the park.
+	bit  [3:0] SS_SUBPIX;
+	always @(posedge CLK) begin
+		if (ENABLE && DCLK_CE)
+			SS_SUBPIX <= '0;
+		else if (SS_SUBPIX != 4'hF)
+			SS_SUBPIX <= SS_SUBPIX + 4'd1;
+	end
+	
+	wire [31:0] SS_IRQ_LIVE = {4'b0000, IPL_N, SCOL_FLAG, SOVR_FLAG, Z80_INT_WAIT, Z80_INT_FLAG, VINT_FLAG, HINT_FLAG, HINT_EN, HINT_COUNT};
+	wire [22:0] SS_POS_LIVE = {SS_SUBPIX, FIELD, V_CNT, H_CNT};
+	
+	bit [SS_RESUME_LAG+1:0] SS_PARK_SR;
+	always @(posedge CLK) begin
+		SS_PARK_SR <= {SS_PARK_SR[SS_RESUME_LAG:0], SS_PARK};
+		if (SS_PARK && !SS_PARK_SR[0])
+			SS_PARK_POS <= SS_POS_LIVE;
+		if (SS_PARK_SR[SS_RESUME_LAG] && !SS_PARK_SR[SS_RESUME_LAG+1]) begin
+			SS_PARK_IRQ <= SS_IRQ_LIVE;
+			SS_PARK_HV <= HV;
+		end
+		
+		if (SS_REG_WE) begin
+			case (SS_ADDR)
+				8'h09: SS_PARK_IRQ <= {4'b0000, SS_WR_DATA[27:0]};
+				8'h0A: SS_PARK_POS <= SS_WR_DATA[22:0];
+				8'h0B: SS_PARK_HV <= SS_WR_DATA[15:0];
+				default:;
+			endcase
+		end
+	end
+	
+	// Resume only after the restored state has gone through the raster: one frame start
+	// and at least three line starts since the stream ended, so per-line and per-frame
+	// latches are rebuilt from restored data.
+	bit        SS_ARM_FRAME;
+	bit  [1:0] SS_ARM_LINES;
+	always @(posedge CLK) begin
+		if (SS_ACTIVE || !SS_PARK) begin
+			SS_ARM_FRAME <= 0;
+			SS_ARM_LINES <= '0;
+		end else if (ENABLE && DCLK_CE && ((H_CNT == 9'h109 && !H40) || (H_CNT == 9'h149 && H40))) begin
+			if (SS_ARM_LINES != 2'd3)
+				SS_ARM_LINES <= SS_ARM_LINES + 2'd1;
+			if (V_CNT == 9'h1FF)
+				SS_ARM_FRAME <= 1;
+		end
+	end
+	
+	// The field only matters when interlaced. A dot shorter than the latched MCLK offset
+	// (mode differs from the image) matches on its last clock.
+	wire SS_POS_HV = H_CNT == SS_PARK_POS[8:0] && V_CNT == SS_PARK_POS[17:9] && (!MR4.LSM[0] || FIELD == SS_PARK_POS[18]);
+	wire SS_POS_SUB = SS_SUBPIX == SS_PARK_POS[22:19] || (ENABLE && DCLK_CE && SS_SUBPIX < SS_PARK_POS[22:19]);
+	assign SS_PHASE_OK = SS_PARK && !SS_ACTIVE && SS_ARM_FRAME && &SS_ARM_LINES && SS_POS_HV && SS_POS_SUB;
+	
+	// A fill armed by its control word waits for a CPU data write, so it is stored (word 06)
+	// instead of being waited for. Everything else here finishes on its own.
+	always @(posedge CLK) begin
+		SS_QUIET <= FIFO_EMPTY && DTC == DTC_IDLE && !DT_RD_PEND && !DT_RD_EXEC && DMAC == DMA_IDLE &&
+		            !DMA_VBUS && !DMA_COPY && !DMA_COPY_WE && !DMA_FILL_START && !DMA_FILL_WE &&
+		            FF_BR_N && FF_BGACK_N && !FF_VBUS_SEL;
+	end
+	
+	bit [31:0] SS_REG_Q;
+	always_comb begin
+		case (SS_ADDR)
+			8'h00: SS_REG_Q = {NTW, NTA, MR2, MR1};
+			8'h01: SS_REG_Q = {BGC, 8'h00, SAT, NTB};
+			8'h02: SS_REG_Q = {MR3, HIR, 8'h00, 8'h00};
+			8'h03: SS_REG_Q = {AI, 8'h00, NSDT, MR4};
+			8'h04: SS_REG_Q = {DLC[7:0], WVP, WHP, SS};
+			8'h05: SS_REG_Q = {DSA, DLC[15:8]};
+			8'h06: SS_REG_Q = {DMA_FILL, FIFO.AMOUNT, FIFO.WR_POS, FIFO.RD_POS, PENDING, CODE, ADDR};
+			8'h07: SS_REG_Q = {OPEN_BUS, DBG};
+			8'h08: SS_REG_Q = {8'h00, DMA_FILL_CODE, DT_RD_CODE, DT_RD_DATA};
+			8'h09: SS_REG_Q = SS_PARK ? SS_PARK_IRQ : SS_IRQ_LIVE;
+			8'h0A: SS_REG_Q = {9'h000, SS_PARK ? SS_PARK_POS : SS_POS_LIVE};
+			8'h0B: SS_REG_Q = {16'h0000, SS_PARK ? SS_PARK_HV : HV};
+			8'h10, 8'h12, 8'h14, 8'h16: SS_REG_Q = {11'h000, FIFO.ITEMS[SS_ADDR[2:1]].CODE, FIFO.ITEMS[SS_ADDR[2:1]].ADDR};
+			8'h11, 8'h13, 8'h15, 8'h17: SS_REG_Q = {16'h0000, FIFO.ITEMS[SS_ADDR[2:1]].DATA};
+			default: SS_REG_Q = '0;
+		endcase
+	end
+	
+	always @(posedge CLK) begin
+		case (SS_SEL)
+			2'd0: SS_RD_DATA <= {23'h000000, CRAM_Q_B};
+			2'd1: SS_RD_DATA <= {21'h000000, VSRAM_Q_B};
+			2'd2: SS_RD_DATA <= OBJC_Q;
+			2'd3: SS_RD_DATA <= SS_REG_Q;
+		endcase
+	end
 	
 	
 	//debug
