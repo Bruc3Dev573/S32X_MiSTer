@@ -36,7 +36,7 @@
 module jt12_acc(
     input               rst,
     input               clk,
-    input               clk_en,
+    input               clk_en /* synthesis direct_enable */,
     input               ladder,
     input               channel_en,
     input signed [8:0]  op_result,
@@ -52,7 +52,12 @@ module jt12_acc(
     input   signed [8:0] pcm,
     // combined output
     output reg signed   [15:0]  left,
-    output reg signed   [15:0]  right
+    output reg signed   [15:0]  right,
+    // Savestate scan chain, see jt12_sh.v
+    input               ss_scan,
+    input               ss_si,
+    output              ss_so,
+    output      [12:0]  ss_n
 );
 
 reg sum_en;
@@ -68,35 +73,79 @@ end
 
 reg pcm_sum;
 
-always @(posedge clk) if(clk_en)
+// Savestate scan chain: pcm_sum, the accumulator, the output registers
+wire        ss_c_acc;
+wire [12:0] ss_n_acc;
+wire [35:0] ss_q;
+assign ss_so = ss_q[35];
+assign ss_n  = 13'd1 + ss_n_acc + 13'd36;
+
+always @(posedge clk) if( ss_scan )
+    pcm_sum <= ss_si;
+else if(clk_en)
     if( zero ) pcm_sum <= 1'b1;
     else if( ch6op ) pcm_sum <= 1'b0;
 
 wire use_pcm = ch6op && pcm_en;
 wire sum_or_pcm = sum_en | use_pcm;
+// wire left_en = rl[1];
+// wire right_en= rl[0];
 wire signed [8:0] pcm_data = pcm_sum ? pcm : 9'd0;
-
+// wire [8:0] acc_input =  use_pcm ? pcm_data : op_result;
 wire signed [8:0] acc_input = ~channel_en ? 9'd0 : (use_pcm ? pcm_data : op_result);
 
 // Continuous output
-wire signed   [8:0]  acc_out;
+// wire signed   [11:0]  pre_left, pre_right;
+wire signed [8:0] acc_out;
+// jt12_single_acc #(.win(9),.wout(12)) u_left(
 jt12_single_acc #(.win(9),.wout(9)) u_acc(
     .clk        ( clk            ),
     .clk_en     ( clk_en         ),
     .op_result  ( acc_input      ),
+    // .sum_en     ( sum_or_pcm & left_en ),
     .sum_en     ( sum_or_pcm     ),
     .zero       ( zero           ),
-    .snd        ( acc_out        )
+    // .snd        ( pre_left       )
+    .snd        ( acc_out        ),
+    .ss_scan    ( ss_scan        ),
+    .ss_si      ( pcm_sum        ),
+    .ss_so      ( ss_c_acc       ),
+    .ss_n       ( ss_n_acc       )
 );
+
+// jt12_single_acc #(.win(9),.wout(12)) u_right(
+//     .clk        ( clk            ),
+//     .clk_en     ( clk_en         ),
+//     .op_result  ( acc_input      ),
+//     .sum_en     ( sum_or_pcm & right_en ),
+//     .zero       ( zero           ),
+//     .snd        ( pre_right      )
+// );
+
+// Output can be amplied by 8/6=1.33 to use full range
+// an easy alternative is to add 1/4th and get 1.25 amplification
+// always @(posedge clk) if(clk_en) begin
+//     left  <= pre_left  + { {2{pre_left [11]}}, pre_left [11:2] };
+//     right <= pre_right + { {2{pre_right[11]}}, pre_right[11:2] };
+// end
 
 wire signed [15:0] acc_expand = {{7{acc_out[8]}}, acc_out};
 
 reg [1:0] rl_latch, rl_old;
 
-wire signed [4:0] ladder_left = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd7 : (rl_old[1] ? 5'd0 : -5'd6));
-wire signed [4:0] ladder_right = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd7 : (rl_old[0] ? 5'd0 : -5'd6));
+// Per-channel DAC discontinuity as measured on the die (Nuked OPN2
+// OPN2_ChOutput, YM2612 mode): over a sample the channel holds the 9-bit
+// bus for 4 cycles, contributing value+1 once and its sign the other 3 -
+// net +4 above zero / -3 below when panned in, and a +4/-4 sign leak even
+// when panned out.
+wire signed [4:0] ladder_left  = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd4 : (rl_old[1] ? -5'd3 : -5'd4));
+wire signed [4:0] ladder_right = ~ladder ? 5'd0 : (acc_expand >= 0 ? 5'd4 : (rl_old[0] ? -5'd3 : -5'd4));
 
-always @(posedge clk) if(clk_en) begin
+assign ss_q = { rl_latch, rl_old, left, right };
+
+always @(posedge clk) if( ss_scan )
+    { rl_latch, rl_old, left, right } <= { ss_q[34:0], ss_c_acc };
+else if(clk_en) begin
     if (channel_en)
         rl_latch <= rl;
     if (zero)

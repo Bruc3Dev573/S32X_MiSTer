@@ -108,8 +108,12 @@ package T80_Pack is
 		R800_mode       : in  std_logic := '0';
 		out0            : in  std_logic := '0';  -- 0 => OUT(C),0, 1 => OUT(C),255
 		REG             : out std_logic_vector(211 downto 0); -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
+		InstBound       : out std_logic;
+		SEQ             : out std_logic_vector(111 downto 0);
 		DIRSet          : in  std_logic := '0';
-		DIR             : in  std_logic_vector(211 downto 0) := (others => '0') -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
+		DIR             : in  std_logic_vector(211 downto 0) := (others => '0'); -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
+		DIRHalt         : in  std_logic := '0';
+		DIRSeq          : in  std_logic_vector(111 downto 0) := (others => '0')
 	);
 	end component;
 

@@ -87,8 +87,12 @@ entity T80pa is
         DO          : out std_logic_vector(7 downto 0);
         R800_mode   : in  std_logic := '0';
         REG         : out std_logic_vector(211 downto 0); -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
+        InstBound   : out std_logic;                      -- T2 of the opcode fetch of a new instruction (see T80)
+        SEQ         : out std_logic_vector(119 downto 0); -- data input latch (119-112, the opcode at an InstBound) and T80 SEQ
         DIRSet      : in  std_logic := '0';
-        DIR         : in  std_logic_vector(211 downto 0) := (others => '0') -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
+        DIR         : in  std_logic_vector(211 downto 0) := (others => '0'); -- IFF2, IFF1, IM, IY, HL', DE', BC', IX, HL, DE, BC, PC, SP, R, I, F', A', F, A
+        DIRHalt     : in  std_logic := '0';               -- HALT state, restored with DIRSet
+        DIRSeq      : in  std_logic_vector(119 downto 0) := (others => '0') -- SEQ, restored with DIRSet (T80 SEQ if bit 0 is set)
     );
 end T80pa;
 
@@ -106,10 +110,25 @@ architecture rtl of T80pa is
     signal CEN_pol          : std_logic;
     signal CEN              : std_logic;
     signal Wait_s           : std_logic;
+    -- Set by DIRSet: the first clock enable after it, CEN_p or CEN_n, is taken whatever
+    -- CEN_pol. The enables alternate, so the first one the restored core sees is the one
+    -- the saved core was waiting for: CEN_pol is then the saved one, without storing it.
+    signal Pol_free         : std_logic := '0';
+    -- The opcode of the fetch an InstBound shows: DI as long as InstBound holds, so in a
+    -- parked core the opcode the end of T2 will load. DIRSet loads it from DIRSeq, and
+    -- Op_hold gives it to T80 for that end of T2 in place of DI, which a restored core
+    -- cannot count on: the read it shows has not been answered again by then.
+    signal InstBound_i      : std_logic;
+    signal DI_IB            : std_logic_vector(7 downto 0);
+    signal Op_hold          : std_logic := '0';
+    signal DInst            : std_logic_vector(7 downto 0);
 begin
 
-    CEN <= CEN_p and not CEN_pol;
+    CEN <= CEN_p and (not CEN_pol or Pol_free);
     BUSAK_n <= BUSAK;
+    SEQ(119 downto 112) <= DI_Reg when BUSAK = '0' else DI_IB;
+    InstBound <= InstBound_i;
+    DInst <= DI_IB when Op_hold = '1' else DI;
 
     u0 : T80
         generic map(
@@ -132,7 +151,7 @@ begin
             BUSAK_n => BUSAK,
             CLK_n   => CLK,
             A       => A,
-            DInst   => DI,     -- valid   at beginning of T3
+            DInst   => DInst,  -- valid   at beginning of T3
             DI      => DI_Reg, -- latched at middle    of T3
             DO      => DO,
             REG     => REG,
@@ -141,9 +160,24 @@ begin
             OUT0    => OUT0,
             R800_mode => R800_mode,
             IntCycle_n => IntCycle_n,
+            InstBound => InstBound_i,
+            SEQ     => SEQ(111 downto 0),
             DIRSet  => DIRSet,
-            DIR     => DIR
+            DIR     => DIR,
+            DIRHalt => DIRHalt,
+            DIRSeq  => DIRSeq(111 downto 0)
         );
+
+    process(CLK)
+    begin
+        if rising_edge(CLK) then
+            if DIRSet = '1' then
+                DI_IB <= DIRSeq(119 downto 112);
+            elsif InstBound_i = '1' and Op_hold = '0' then
+                DI_IB <= DI;
+            end if;
+        end if;
+    end process;
 
     process(CLK)
     begin
@@ -155,9 +189,39 @@ begin
                 MREQ_n  <= '1';
                 DI_Reg  <= "00000000";
                 CEN_pol <= '0';
-            elsif CEN_p = '1' and CEN_pol = '0' then
+                Pol_free <= '0';
+                Op_hold <= '0';
+            elsif DIRSet = '1' then
+                -- A state restore puts the core at T2 of an opcode fetch (see T80), the
+                -- fetch of the opcode at the restored PC in progress, or with the bus
+                -- acknowledged, after the last T state of a machine cycle with the bus idle.
+                WR_n    <= '1';
+                RD_n    <= '1';
+                IORQ_n  <= '1';
+                MREQ_n  <= '1';
+                if DIRSeq(0) = '0' then
+                    RD_n   <= '0';
+                    MREQ_n <= '0';
+                end if;
+                IntCycleD_n <= "11";
+                Pol_free <= '1';
+                -- Wait_s is used only in T2, so only at an InstBound. The saved core
+                -- samples WAIT_n again at the CEN_n of T2, unless it parked after it.
+                -- WAIT_n is high there for a fetch out of the Z80 RAM (only an access to
+                -- the 68000 bank window waits).
+                Wait_s  <= '1';
+                -- At an InstBound, the opcode of the fetch for the end of T2 (see DI_IB).
+                Op_hold <= not DIRSeq(0);
+                -- Saved with the bus acknowledged, the core resumes the instruction the bus
+                -- request stopped (see SEQ in T80), with the data it read in that instruction.
+                if DIRSeq(0) = '1' then
+                    DI_Reg <= DIRSeq(119 downto 112);
+                end if;
+            elsif CEN_p = '1' and (CEN_pol = '0' or Pol_free = '1') then
                 CEN_pol <= '1';
+                Pol_free <= '0';
                 if WAIT_s = '1' or TState /= "010" then
+                    Op_hold <= '0';
                     if MCycle = "001" then
                         if TState = "010" then
                             IORQ_n <= '1';
@@ -172,9 +236,10 @@ begin
                         end if;
                     end if;
                 end if;
-            elsif CEN_n = '1' and CEN_pol = '1' then
+            elsif CEN_n = '1' and (CEN_pol = '1' or Pol_free = '1') then
                 Wait_s <= Wait_n;
                 CEN_pol <= '0';
+                Pol_free <= '0';
                 if TState = "011" and BUSAK = '1' then
                     DI_Reg <= DI;
                 end if;

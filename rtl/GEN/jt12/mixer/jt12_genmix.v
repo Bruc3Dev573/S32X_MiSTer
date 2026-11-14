@@ -35,6 +35,7 @@
 module jt12_genmix(
     input               rst,
     input               clk,
+    input               ce,     // the mixer and its filters hold their state while low
     input signed [15:0] fm_left,
     input signed [15:0] fm_right,
     input signed [10:0] psg_snd,
@@ -64,7 +65,7 @@ always @(posedge clk)
         psgcnt240 <= 3'd0;
         psgcnt144 <= 2'd0;
         psgcnt1008<= 3'd0;
-    end else begin
+    end else if( ce ) begin
         psgcnt48  <= psgcnt48 ==6'd47  ? 6'd0 : psgcnt48 +6'd1;
         if( psgcnt48 == 6'd47 ) begin
             psgcnt240 <= psgcnt240==3'd4 ? 3'd0 : psgcnt240+3'd1;
@@ -74,13 +75,19 @@ always @(posedge clk)
         end
     end
 
-reg psg_cen_1008, psg_cen_240, psg_cen_48, psg_cen_144;
-always @(negedge clk) begin
-    psg_cen_240 <= psgcnt48 ==6'd47 && psgcnt240 == 3'd0;
-    psg_cen_48  <= psgcnt48 ==6'd47;
-    psg_cen_144 <= psgcnt48 ==6'd47 && psgcnt144==2'd0;
-    psg_cen_1008<= psgcnt48 ==6'd47 && psgcnt144==2'd0 && psgcnt1008==3'd0;
+// The enable pulses are registered, so they hold with ce like the counters: a pulse
+// due on the first paused clock fires on the first clock after the pause instead.
+reg psg_cen_1008_r, psg_cen_240_r, psg_cen_48_r, psg_cen_144_r;
+always @(posedge clk) if( ce ) begin
+    psg_cen_240_r <= psgcnt48 ==6'd47 && psgcnt240 == 3'd0;
+    psg_cen_48_r  <= psgcnt48 ==6'd47;
+    psg_cen_144_r <= psgcnt48 ==6'd47 && psgcnt144==2'd0;
+    psg_cen_1008_r<= psgcnt48 ==6'd47 && psgcnt144==2'd0 && psgcnt1008==3'd0;
 end
+wire psg_cen_240  = psg_cen_240_r  & ce;
+wire psg_cen_48   = psg_cen_48_r   & ce;
+wire psg_cen_144  = psg_cen_144_r  & ce;
+wire psg_cen_1008 = psg_cen_1008_r & ce;
 
 wire signed [11:0] psg0, psg1, psg2, psg3; 
 assign psg0 = psg_en ? { psg_snd[10], psg_snd } : 12'b0;
@@ -132,7 +139,7 @@ always @(posedge clk)
         clkcnt252 <= 2'd0;
         clkcnt63  <= 3'd0;
         clkcnt9   <= 4'd0;
-    end else begin
+    end else if( ce ) begin
         clkcnt9   <= clkcnt9  ==4'd8   ? 4'd0 : clkcnt9  +4'd1;
         if( clkcnt9== 4'd8 ) begin
             clkcnt63  <= clkcnt63 ==3'd6  ? 3'd0 : clkcnt63 +3'd1;
@@ -143,17 +150,22 @@ always @(posedge clk)
         end
     end 
 // evenly spaced clock enable signals
-reg cen_1008, cen_252, cen_63, cen_9;
-always @(negedge clk) begin
-    cen_9    <= clkcnt9  ==4'd8;
-    cen_63   <= clkcnt9  ==4'd8 && clkcnt63  ==3'd0;
-    cen_252  <= clkcnt9  ==4'd8 && clkcnt63  ==3'd0 && clkcnt252 ==2'd0;
-    cen_1008 <= clkcnt9  ==4'd8 && clkcnt63  ==3'd0 && clkcnt252 ==2'd0 && clkcnt1008==2'd0;
+reg cen_1008_r, cen_252_r, cen_63_r, cen_9_r;
+always @(posedge clk) if( ce ) begin
+    cen_9_r    <= clkcnt9  ==4'd8;
+    cen_63_r   <= clkcnt9  ==4'd8 && clkcnt63  ==3'd0;
+    cen_252_r  <= clkcnt9  ==4'd8 && clkcnt63  ==3'd0 && clkcnt252 ==2'd0;
+    cen_1008_r <= clkcnt9  ==4'd8 && clkcnt63  ==3'd0 && clkcnt252 ==2'd0 && clkcnt1008==2'd0;
 end
+wire cen_9    = cen_9_r    & ce;
+wire cen_63   = cen_63_r   & ce;
+wire cen_252  = cen_252_r  & ce;
+wire cen_1008 = cen_1008_r & ce;
 
 jt12_fm_uprate u_left(
     .rst        ( rst       ),
     .clk        ( clk       ),
+    .ce         ( ce        ),
     .fm_snd     ( fm_left   ),
     .psg_snd    ( psg3      ),
     .fm_en      ( fm_en     ),
@@ -167,6 +179,7 @@ jt12_fm_uprate u_left(
 jt12_fm_uprate u_right(
     .rst        ( rst       ),
     .clk        ( clk       ),
+    .ce         ( ce        ),
     .fm_snd     ( fm_right  ),
     .psg_snd    ( psg3      ),
     .fm_en      ( fm_en     ),

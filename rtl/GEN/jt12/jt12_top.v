@@ -27,7 +27,7 @@ http://gendev.spritesmind.net/forum/viewtopic.php?t=386&postdays=0&postorder=asc
 module jt12_top (
     input           rst,        // rst should be at least 6 clk&cen cycles long
     input           clk,        // CPU clock
-    input           cen,        // optional clock enable, it not needed leave as 1'b1
+    (* direct_enable *) input cen,        // optional clock enable, if not needed leave as 1'b1
     input   [7:0]   din,
     input   [1:0]   addr,
     input           cs_n,
@@ -46,6 +46,9 @@ module jt12_top (
     output  [23:0]  adpcmb_addr,  // real hardware has 12 pins multiplexed through PMPX pin
     input   [ 7:0]  adpcmb_data,
     output          adpcmb_roe_n, // ADPCM-B ROM output enable
+    // I/O pins used by YM2203 embedded YM2149 chip
+    input      [7:0] IOA_in,
+    input      [7:0] IOB_in,
     // Separated output
     output          [ 7:0] psg_A,
     output          [ 7:0] psg_B,
@@ -60,13 +63,28 @@ module jt12_top (
     output          [ 9:0] psg_snd,
     output  signed  [15:0] snd_right, // FM+PSG
     output  signed  [15:0] snd_left,  // FM+PSG
-    output                 snd_sample
+    output                 snd_sample,
+    input           [ 7:0] debug_bus,
+    output          [ 7:0] debug_view,
+    // Savestate, YM2612 configuration only. ss_hold stops every register of the
+    // chip, as if its clock stopped; the parent masks rst with it. While held,
+    // ss_scan shifts all of them by one bit through one scan chain of ss_n bits
+    // from ss_si to ss_so (see jt12_sh.v), and ss_commit then reloads the ROM
+    // address registers from their copies in the chain.
+    input                  ss_hold,
+    input                  ss_scan,
+    input                  ss_si,
+    output                 ss_so,
+    output          [12:0] ss_n,
+    input                  ss_commit
 );
 
 // parameters to select the features for each chip type
 // defaults to YM2612
 parameter use_lfo=1, use_ssg=0, num_ch=6, use_pcm=1;
 parameter use_adpcm=0;
+parameter JT49_DIV=2;
+parameter mask_div=1;
 
 wire flag_A, flag_B, busy;
 
@@ -148,6 +166,7 @@ wire        up_aon;
 wire        acmd_on_b;     // Control - Process start, Key On
 wire        acmd_rep_b;    // Control - Repeat
 wire        acmd_rst_b;    // Control - Reset
+wire        acmd_up_b;     // Control - New cmd received
 wire [ 1:0] alr_b;         // Left / Right
 wire [15:0] astart_b;      // Start address
 wire [15:0] aend_b;        // End   address
@@ -156,9 +175,11 @@ wire [ 7:0] aeg_b;         // Envelope Generator Control
 wire [ 5:0] adpcma_flags;  // ADPMC-A read over flags
 wire        adpcmb_flag;
 wire [ 6:0] flag_ctl;
+wire [ 1:0] div_setting;
 
+wire clk_en_2, clk_en_666, clk_en_111, clk_en_55;
 
-wire clk_en_666, clk_en_111, clk_en_55;
+assign debug_view = { 4'd0, flag_B, flag_A, div_setting };
 
 generate
 if( use_adpcm==1 ) begin: gen_adpcm
@@ -206,11 +227,12 @@ if( use_adpcm==1 ) begin: gen_adpcm
         .clk        ( clk           ),
         .cen        ( cen           ),
         .cen55      ( clk_en_55     ),
-        
+
         // Control
         .acmd_on_b  ( acmd_on_b     ),  // Control - Process start, Key On
         .acmd_rep_b ( acmd_rep_b    ),  // Control - Repeat
         .acmd_rst_b ( acmd_rst_b    ),  // Control - Reset
+        //.acmd_up_b  ( acmd_up_b     ),  // Control - New command received
         .alr_b      ( alr_b         ),  // Left / Right
         .astart_b   ( astart_b      ),  // Start address
         .aend_b     ( aend_b        ),  // End   address
@@ -229,7 +251,7 @@ if( use_adpcm==1 ) begin: gen_adpcm
     );
 
     /* verilator tracing_on */
-    assign snd_sample   = zero;        
+    assign snd_sample   = zero;
     jt10_acc u_acc(
         .clk        ( clk           ),
         .clk_en     ( clk_en        ),
@@ -264,7 +286,17 @@ end else begin : gen_adpcm_no
 end
 endgenerate
 
-/* verilator tracing_off */
+// Savestate scan chain, in this order: dout, mmr (with the divider and the
+// registers), timers, LFO, PG, EG, the EG pad, the operator, the PCM interpolator,
+// then the six used accumulators.
+wire        ss_c_dout, ss_c_mmr, ss_c_tim, ss_c_lfo, ss_c_pg, ss_c_eg, ss_c_egpad,
+            ss_c_op, ss_c_pcm;
+wire [12:0] ss_n_dout, ss_n_mmr, ss_n_tim, ss_n_lfo, ss_n_pg, ss_n_eg, ss_n_egpad,
+            ss_n_op, ss_n_pcm, ss_n_acc;
+assign ss_n = ss_n_dout + ss_n_mmr + ss_n_tim + ss_n_lfo + ss_n_pg + ss_n_eg + ss_n_egpad
+            + ss_n_op + ss_n_pcm + ss_n_acc;
+
+/* verilator tracing_on */
 jt12_dout #(.use_ssg(use_ssg),.use_adpcm(use_adpcm)) u_dout(
 //    .rst_n          ( rst_n         ),
     .clk            ( clk           ),        // CPU clock
@@ -275,17 +307,23 @@ jt12_dout #(.use_ssg(use_ssg),.use_adpcm(use_adpcm)) u_dout(
     .adpcmb_flag    ( adpcmb_flag   ),
     .psg_dout       ( psg_dout      ),
     .addr           ( addr          ),
-    .dout           ( dout          )
+    .dout           ( dout          ),
+    .ss_hold        ( ss_hold       ),
+    .ss_scan        ( ss_scan       ),
+    .ss_si          ( ss_si         ),
+    .ss_so          ( ss_c_dout     ),
+    .ss_n           ( ss_n_dout     )
 );
 
 
-/* verilator tracing_off */
-jt12_mmr #(.use_ssg(use_ssg),.num_ch(num_ch),.use_pcm(use_pcm), .use_adpcm(use_adpcm))
+/* verilator tracing_on */
+jt12_mmr #(.use_ssg(use_ssg),.num_ch(num_ch),.use_pcm(use_pcm), .use_adpcm(use_adpcm), .mask_div(mask_div))
     u_mmr(
     .rst        ( rst       ),
     .clk        ( clk       ),
     .cen        ( cen       ),  // external clock enable
     .clk_en     ( clk_en    ),  // internal clock enable
+    .clk_en_2   ( clk_en_2  ),  // input cen divided by 2
     .clk_en_ssg ( clk_en_ssg),  // internal clock enable
     .clk_en_666 ( clk_en_666),
     .clk_en_111 ( clk_en_111),
@@ -330,11 +368,12 @@ jt12_mmr #(.use_ssg(use_ssg),.num_ch(num_ch),.use_pcm(use_pcm), .use_adpcm(use_a
     .acmd_on_b  ( acmd_on_b     ),  // Control - Process start, Key On
     .acmd_rep_b ( acmd_rep_b    ),  // Control - Repeat
     .acmd_rst_b ( acmd_rst_b    ),  // Control - Reset
+    .acmd_up_b  ( acmd_up_b     ),  // Control - New command received
     .alr_b      ( alr_b         ),  // Left / Right
     .astart_b   ( astart_b      ),  // Start address
     .aend_b     ( aend_b        ),  // End   address
     .adeltan_b  ( adeltan_b     ),  // Delta-N
-    .aeg_b      ( aeg_b         ),  // Envelope Generator Control    
+    .aeg_b      ( aeg_b         ),  // Envelope Generator Control
     .flag_ctl   ( flag_ctl      ),
     // Operator
     .xuse_prevprev1 ( xuse_prevprev1  ),
@@ -380,26 +419,42 @@ jt12_mmr #(.use_ssg(use_ssg),.num_ch(num_ch),.use_pcm(use_pcm), .use_adpcm(use_a
     // PSG interace
     .psg_addr   ( psg_addr  ),
     .psg_data   ( psg_data  ),
-    .psg_wr_n   ( psg_wr_n  )
+    .psg_wr_n   ( psg_wr_n  ),
+    .debug_bus  ( debug_bus ),
+    .div_setting(div_setting),
+    .ss_hold    ( ss_hold   ),
+    .ss_scan    ( ss_scan   ),
+    .ss_si      ( ss_c_dout ),
+    .ss_so      ( ss_c_mmr  ),
+    .ss_n       ( ss_n_mmr  )
 );
 
-/* verilator tracing_off */
-jt12_timers u_timers(
+/* verilator tracing_on */
+// YM2203 seems to use a fixed cen/3 clock for the timers, regardless
+// of the prescaler setting
+wire timer_cen = fast_timers ? (cen & ~ss_hold) : clk_en;
+jt12_timers #(.num_ch(num_ch)) u_timers (
     .clk        ( clk           ),
-    .clk_en     ( clk_en | fast_timers  ),
+    .clk_en     ( timer_cen     ),
     .rst        ( rst           ),
+    .zero       ( zero          ),
     .value_A    ( value_A       ),
     .value_B    ( value_B       ),
     .load_A     ( load_A        ),
     .load_B     ( load_B        ),
-    .enable_irq_A( enable_irq_B ),
-    .enable_irq_B( enable_irq_A ),
+    .enable_irq_A( enable_irq_A ),
+    .enable_irq_B( enable_irq_B ),
     .clr_flag_A ( clr_flag_A    ),
     .clr_flag_B ( clr_flag_B    ),
     .flag_A     ( flag_A        ),
     .flag_B     ( flag_B        ),
     .overflow_A ( overflow_A    ),
-    .irq_n      ( irq_n         )
+    .irq_n      ( irq_n         ),
+    .ss_hold    ( ss_hold       ),
+    .ss_scan    ( ss_scan       ),
+    .ss_si      ( ss_c_mmr      ),
+    .ss_so      ( ss_c_tim      ),
+    .ss_n       ( ss_n_tim      )
 );
 
 // YM2203 does not have LFO
@@ -417,10 +472,17 @@ if( use_lfo== 1) begin : gen_lfo
         `endif
         .lfo_en     ( lfo_en    ),
         .lfo_freq   ( lfo_freq  ),
-        .lfo_mod    ( lfo_mod   )
+        .lfo_mod    ( lfo_mod   ),
+        .ss_hold    ( ss_hold   ),
+        .ss_scan    ( ss_scan   ),
+        .ss_si      ( ss_c_tim  ),
+        .ss_so      ( ss_c_lfo  ),
+        .ss_n       ( ss_n_lfo  )
     );
 end else begin : gen_nolfo
     assign lfo_mod = 7'd0;
+    assign ss_c_lfo = ss_c_tim;
+    assign ss_n_lfo = 13'd0;
 end
 endgenerate
 
@@ -429,7 +491,8 @@ endgenerate
 `ifndef NOSSG
 generate
     if( use_ssg==1 ) begin : gen_ssg
-        jt49 u_psg( // note that input ports are not multiplexed
+        jt49 #(.COMP(2'b01), .CLKDIV(JT49_DIV))
+            u_psg( // note that input ports are not multiplexed
             .rst_n      ( ~rst      ),
             .clk        ( clk       ),    // signal on positive edge
             .clk_en     ( clk_en_ssg),    // clock enable on negative edge
@@ -444,10 +507,11 @@ generate
             .dout       ( psg_dout  ),
             .sel        ( 1'b1      ),  // half clock speed
             // Unused:
-            .IOA_out    (),
-            .IOB_out    (),
-            .IOA_in     (8'd0),
-            .IOB_in     (8'd0)
+            .IOA_out    (           ),
+            .IOB_out    (           ),
+            .IOA_in     ( IOA_in    ),
+            .IOB_in     ( IOB_in    ),
+            .sample     (           )
         );
         assign snd_left  = fm_snd_left  + { 1'b0, psg_snd[9:0],5'd0};
         assign snd_right = fm_snd_right + { 1'b0, psg_snd[9:0],5'd0};
@@ -471,7 +535,7 @@ endgenerate
 wire    [ 8:0]  op_result;
 wire    [13:0]  op_result_hd;
 `ifndef NOFM
-/* verilator tracing_off */
+/* verilator tracing_on */
 jt12_pg #(.num_ch(num_ch)) u_pg(
     .rst        ( rst           ),
     .clk        ( clk           ),
@@ -490,7 +554,11 @@ jt12_pg #(.num_ch(num_ch)) u_pg(
     .pg_rst_II  ( pg_rst_II     ),
     .pg_stop    ( pg_stop       ),
     .keycode_II ( keycode_II    ),
-    .phase_VIII ( phase_VIII    )
+    .phase_VIII ( phase_VIII    ),
+    .ss_scan    ( ss_scan       ),
+    .ss_si      ( ss_c_lfo      ),
+    .ss_so      ( ss_c_pg       ),
+    .ss_n       ( ss_n_pg       )
 );
 
 wire [9:0] eg_V;
@@ -521,14 +589,22 @@ jt12_eg #(.num_ch(num_ch)) u_eg(
     .amsen_IV       ( amsen_IV      ),
 
     .eg_V           ( eg_V          ),
-    .pg_rst_II      ( pg_rst_II     )
+    .pg_rst_II      ( pg_rst_II     ),
+    .ss_scan        ( ss_scan       ),
+    .ss_si          ( ss_c_pg       ),
+    .ss_so          ( ss_c_eg       ),
+    .ss_n           ( ss_n_eg       )
 );
 
 jt12_sh #(.width(10),.stages(4)) u_egpad(
     .clk    ( clk       ),
     .clk_en ( clk_en    ),
     .din    ( eg_V      ),
-    .drop   ( eg_IX     )
+    .drop   ( eg_IX     ),
+    .ss_scan( ss_scan   ),
+    .ss_si  ( ss_c_eg   ),
+    .ss_so  ( ss_c_egpad),
+    .ss_n   ( ss_n_egpad)
 );
 
 jt12_op #(.num_ch(num_ch)) u_op(
@@ -552,9 +628,14 @@ jt12_op #(.num_ch(num_ch)) u_op(
     .yuse_prev2     ( yuse_prev2    ),
     .zero           ( zero          ),
     .op_result      ( op_result     ),
-    .full_result    ( op_result_hd  )
+    .full_result    ( op_result_hd  ),
+    .ss_scan        ( ss_scan       ),
+    .ss_si          ( ss_c_egpad    ),
+    .ss_so          ( ss_c_op       ),
+    .ss_n           ( ss_n_op       ),
+    .ss_commit      ( ss_commit     )
 );
-`else 
+`else
 assign op_result    = 'd0;
 assign op_result_hd = 'd0;
 `endif
@@ -569,8 +650,8 @@ assign fm_snd_right = accum_r[0] + accum_r[1] + accum_r[2] + accum_r[4] + accum_
 
 generate
     if( use_pcm==1 ) begin: gen_pcm_acc // YM2612 accumulator
-        //assign fm_snd_right[3:0] = 4'd0;
-        //assign fm_snd_left [3:0] = 4'd0;
+        // assign fm_snd_right[3:0] = 4'd0;
+        // assign fm_snd_left [3:0] = 4'd0;
         assign snd_sample        = zero;
         reg signed [8:0] pcm2;
 
@@ -600,7 +681,7 @@ generate
         wire signed [10:0] pcm_full;
         always @(*)
             pcm2 = en_hifi_pcm ? pcm_full[9:1] : pcm;
-            
+
         jt12_pcm_interpol #(.dw(11), .stepw(5)) u_pcm (
             .rst_n ( rst_pcm_n      ),
             .clk   ( clk            ),
@@ -608,38 +689,64 @@ generate
             .cen55 ( clk_en_55      ),
             .pcm_wr( pcm_wr         ),
             .pcmin ( {pcm[8],pcm, 1'b0}    ),
-            .pcmout( pcm_full       )
+            .pcmout( pcm_full       ),
+            .ss_hold( ss_hold       ),
+            .ss_scan( ss_scan       ),
+            .ss_si  ( ss_c_op       ),
+            .ss_so  ( ss_c_pcm      ),
+            .ss_n   ( ss_n_pcm      )
         );
         `else
         assign pcm2 = pcm;
+        assign ss_c_pcm = ss_c_op;
+        assign ss_n_pcm = 13'd0;
         `endif
 
-        for (i = 0; i < 7; i = i + 1) begin : accumulator_block
-            jt12_acc u_acc(
-                .rst        ( rst       ),
-                .clk        ( clk       ),
-                .clk_en     ( clk_en    ),
-                .channel_en (cur_ch == i),
-                .ladder     ( ladder    ),
-                .op_result  ( op_result ),
-                .rl         ( rl        ),
-                // note that the order changes to deal
-                // with the operator pipeline delay
-                .zero       ( zero      ),
-                .s1_enters  ( s2_enters ),
-                .s2_enters  ( s1_enters ),
-                .s3_enters  ( s4_enters ),
-                .s4_enters  ( s3_enters ),
-                .ch6op      ( ch6op     ),
-                .pcm_en     ( pcm_en    ),  // only enabled for channel 6
-                .pcm        ( pcm2      ),
-                .alg        ( alg_I     ),
-                // combined output
-                .left       ( accum_l[i]),
-                .right      ( accum_r[i])
-            );
-        end
+        // Channel index 3 does not exist: its accumulator stays out of the chain,
+        // so that synthesis still removes it.
+        wire [7:0]    ss_c_acc;
+        wire [8*13-1:0] ss_n_sum;
+        assign ss_c_acc[0]      = ss_c_pcm;
+        assign ss_n_sum[12:0]   = 13'd0;
+        assign ss_so            = ss_c_acc[7];
+        assign ss_n_acc         = ss_n_sum[7*13 +: 13];
 
+        for (i = 0; i < 7; i = i + 1) begin : accumulator_block
+        wire        ss_so_i;
+        wire [12:0] ss_n_i;
+        assign ss_c_acc[i+1]            = (i == 3) ? ss_c_acc[i] : ss_so_i;
+        assign ss_n_sum[(i+1)*13 +: 13] = ss_n_sum[i*13 +: 13] + ((i == 3) ? 13'd0 : ss_n_i);
+
+        jt12_acc u_acc(
+            .rst        ( rst       ),
+            .clk        ( clk       ),
+            .clk_en     ( clk_en    ),
+            .channel_en (cur_ch == i),
+            .ladder     ( ladder    ),
+            .op_result  ( op_result ),
+            .rl         ( rl        ),
+            // note that the order changes to deal
+            // with the operator pipeline delay
+            .zero       ( zero      ),
+            .s1_enters  ( s2_enters ),
+            .s2_enters  ( s1_enters ),
+            .s3_enters  ( s4_enters ),
+            .s4_enters  ( s3_enters ),
+            .ch6op      ( ch6op     ),
+            .pcm_en     ( pcm_en    ),  // only enabled for channel 6
+            .pcm        ( pcm2      ),
+            .alg        ( alg_I     ),
+            // combined output
+            // .left       ( fm_snd_left [15:4]  ),
+            // .right      ( fm_snd_right[15:4]  )
+            .left       ( accum_l[i]),
+            .right      ( accum_r[i]),
+            .ss_scan    ( (i != 3) & ss_scan ),
+            .ss_si      ( ss_c_acc[i]),
+            .ss_so      ( ss_so_i   ),
+            .ss_n       ( ss_n_i    )
+        );
+        end
     end
     if( use_pcm==0 && use_adpcm==0 ) begin : gen_2203_acc // YM2203 accumulator
         wire signed [15:0] mono_snd;

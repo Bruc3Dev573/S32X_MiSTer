@@ -23,7 +23,7 @@
 module jt12_csr( // Circular Shift Register + input mux
     input           rst,
     input           clk,
-    input           clk_en,
+    input           clk_en /* synthesis direct_enable */,
     input   [ 7:0]  din,
     input   [43:0]  shift_in,
     output  [43:0]  shift_out,
@@ -37,7 +37,12 @@ module jt12_csr( // Circular Shift Register + input mux
     input           up_ssgeg,  
     input           update_op_I,
     input           update_op_II,
-    input           update_op_IV
+    input           update_op_IV,
+    // Savestate scan chain, see jt12_sh.v
+    input           ss_scan,
+    input           ss_si,
+    output          ss_so,
+    output  [12:0]  ss_n
 );
 
 localparam regop_width=44;
@@ -49,7 +54,11 @@ jt12_sh_rst #(.width(regop_width),.stages(12)) u_regch(
     .clk_en ( clk_en       ),
     .rst    ( rst          ),
     .din    ( regop_in     ),
-    .drop   ( shift_out    )
+    .drop   ( shift_out    ),
+    .ss_scan( ss_scan      ),
+    .ss_si  ( ss_si        ),
+    .ss_so  ( ss_so        ),
+    .ss_n   ( ss_n         )
 );
 
 wire up_tl_op   = up_tl     & update_op_IV;

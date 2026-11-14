@@ -30,6 +30,7 @@ port
 (
     rst     : in  std_logic;
     clk     : in  std_logic;    -- expects 54 MHz clock
+    ce      : in  std_logic;    -- holds the mixer while low
     fm_left : in  std_logic_vector(15 downto 0); -- FM at 55kHz
     fm_right: in  std_logic_vector(15 downto 0); -- FM at 55kHz
     psg_snd : in  std_logic_vector(10 downto 0); -- PSG at 220kHz

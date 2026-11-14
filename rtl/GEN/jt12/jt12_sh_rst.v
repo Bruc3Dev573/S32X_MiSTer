@@ -18,19 +18,28 @@
 	Date: 1-31-2017
 	*/
 
-`timescale 1ns / 1ps
 
 // stages must be greater than 2
 module jt12_sh_rst #(parameter width=5, stages=32, rstval=1'b0 )
 (
 	input					rst,	
 	input 					clk,
-	input					clk_en,
+	input					clk_en /* synthesis direct_enable */,
 	input		[width-1:0]	din,
-   	output		[width-1:0]	drop
+   	output		[width-1:0]	drop,
+	// Savestate scan chain, as in jt12_sh
+	input					ss_scan,
+	input					ss_si,
+	output					ss_so,
+	output			[12:0]	ss_n
 );
 
 reg [stages-1:0] bits[width-1:0];
+
+wire [width:0]   ss_lanes = { drop, ss_si };
+wire [width-1:0] din_m    = ss_scan ? ss_lanes[width-1:0] : din;
+assign ss_so = drop[width-1];
+assign ss_n  = width*stages;
 
 genvar i;
 integer k;
@@ -43,11 +52,11 @@ endgenerate
 
 generate
 	for (i=0; i < width; i=i+1) begin: bit_shifter
-		always @(posedge clk) 
+		always @(posedge clk, posedge rst) 
 			if( rst ) begin
 				bits[i] <= {stages{rstval}};
-			end else if(clk_en) begin
-				bits[i] <= {bits[i][stages-2:0], din[i]};
+			end else if(clk_en | ss_scan) begin
+				bits[i] <= {bits[i][stages-2:0], din_m[i]};
 			end
 		assign drop[i] = bits[i][stages-1];
 	end

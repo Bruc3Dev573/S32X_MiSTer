@@ -28,7 +28,10 @@ module jt89_vol(
     input         rst,
     input         din,
     input  [3:0]  vol,
-    output reg signed [8:0]  snd   
+    output reg signed [8:0]  snd,
+    // Savestate restore of the output register, only while the PSG is frozen.
+    input         ss_set,
+    input  [8:0]  ss_snd
 );
 
 
@@ -57,6 +60,8 @@ always @(*)
 always @(posedge clk)
     if( rst )
         snd <= 9'd0;
+    else if( ss_set )
+        snd <= ss_snd;
     else if( clk_en )
         snd <= din ? {1'b0,max} : -{1'b0,max};
 

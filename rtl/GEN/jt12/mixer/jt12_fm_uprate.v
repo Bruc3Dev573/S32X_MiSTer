@@ -32,6 +32,7 @@
 module jt12_fm_uprate(
     input               rst,
     input               clk,
+    input               ce,     // the clk-rate stages hold while low; the cen_* come gated
     input signed [15:0] fm_snd,
     input signed [11:0] psg_snd,
     input fm_en,  // enable FM
@@ -45,7 +46,7 @@ module jt12_fm_uprate(
 wire signed [15:0] fm2,fm3,fm4;
 
 reg [15:0] mixed;
-always @(posedge clk)
+always @(posedge clk) if( ce )
     mixed <= (fm_en?fm_snd:16'd0) + {{1{psg_snd[11]}},psg_snd,3'b0};
 
 // 1008 --> 252 x4
@@ -87,7 +88,7 @@ u_fm5(
     .clk    ( clk      ),
     .rst    ( rst      ),        
     .cen_in ( cen_9    ),
-    .cen_out( 1'b1     ),
+    .cen_out( ce       ),
     .snd_in ( fm4      ),
     .snd_out( snd      )
 );

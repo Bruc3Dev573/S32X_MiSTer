@@ -16,10 +16,10 @@
     Author: Jose Tejada Gomez. Twitter: @topapate
     Version: 1.0
     Date: March, 8th 2017
-    
+
     This work was originally based in the implementation found on the
     SMS core of MiST. Some of the changes, all according to data sheet:
-    
+
         -Fixed volume
         -Fixed tone 2 rate option of noise generator
         -Fixed rate of noise generator
@@ -27,7 +27,7 @@
         -Fixed noise generator update bug by which it gets updated
             multiple times if v='0'
         -Added all 0's prevention circuit to noise generator
-    
+
     */
 
 module jt89(
@@ -37,17 +37,55 @@ module jt89(
     input          wr_n,
     input    [7:0] din,
     output  signed [10:0] sound,
-    output         ready
+    output         ready,
+
+    // Savestate, region PSG_REGS. The PSG is write only, so these taps are the
+    // only way to capture its state. All state is in flops.
+    //   0  tone periods            1  volumes, latched register, noise control
+    //   2  tone counters           3  noise shift register and counter, tone outputs
+    //   4  clock divider, tone volume stages   5  noise volume stage
+    // Words 2-5 are applied together when word 5 is written.
+    input    [2:0] ss_addr,
+    input   [31:0] ss_wr_data,
+    input          ss_wr_en,
+    output  [31:0] ss_rd_data
 );
+
+wire [9:0]  ss_cnt0, ss_cnt1, ss_cnt2;
+wire [26:0] ss_noise;
+wire        out0, out1, out2;
+reg  [31:0] ss_w2, ss_w3, ss_w4;
+wire        ss_set = ss_wr_en && ss_addr == 3'd5;
+
+assign ss_rd_data =
+    (ss_addr == 3'd0) ? {2'd0, tone2, tone1, tone0} :
+    (ss_addr == 3'd1) ? {12'd0, ctrl3, regn, vol3, vol2, vol1, vol0} :
+    (ss_addr == 3'd2) ? {2'd0, ss_cnt2, ss_cnt1, ss_cnt0} :
+    (ss_addr == 3'd3) ? {ss_noise, out2, out1, out0, 2'd0} :
+    (ss_addr == 3'd4) ? {clk_div, 1'b0, ch2, ch1, ch0} :
+    (ss_addr == 3'd5) ? {23'd0, noise} :
+                        32'd0;
+
+always @(posedge clk)
+    if( ss_wr_en ) begin
+        if( ss_addr == 3'd2 ) ss_w2 <= ss_wr_data;
+        if( ss_addr == 3'd3 ) ss_w3 <= ss_wr_data;
+        if( ss_addr == 3'd4 ) ss_w4 <= ss_wr_data;
+    end
+
+parameter interpol16=0;
 
 wire signed [ 8:0] ch0, ch1, ch2, noise;
 
 assign ready = 1'b1;
+(* direct_enable = 1 *) reg cen_16;
+(* direct_enable = 1 *) reg cen_4;
 
-jt89_mixer mix(
+jt89_mixer #(.interpol16(interpol16)) mix(
     .clk    ( clk   ),
     .clk_en ( clk_en), // uses main clock enable
     .cen_16 ( cen_16),
+    .cen_4  ( cen_4 ),
     .rst    ( rst   ),
     .ch0    ( ch0   ),
     .ch1    ( ch1   ),
@@ -63,25 +101,30 @@ reg [2:0] ctrl3;
 reg [2:0] regn;
 
 reg [3:0] clk_div;
-(* direct_enable = 1 *) reg cen_16;
 
-always @(negedge clk )
+always @(posedge clk )
     if( rst ) begin
         cen_16 <= 1'b1;
+        cen_4  <= 1'b1;
     end else begin
         cen_16 <= clk_en & (&clk_div);
+        cen_4  <= clk_en & (&clk_div[1:0]);
     end
 
 always @(posedge clk )
-    if( rst ) 
+    if( rst )
         clk_div <= 4'd0;
+    else if( ss_set )
+        clk_div <= ss_w4[31:28];
     else if( clk_en )
         clk_div <= clk_div + 1'b1;
 
 reg clr_noise, last_wr;
+
+// Savestate restore is at the end of the register process below.
 wire [2:0] reg_sel = din[7] ? din[6:4] : regn;
 
-always @(posedge clk) 
+always @(posedge clk)
     if( rst ) begin
         { vol0, vol1, vol2, vol3 } <= {16{1'b1}};
         { tone0, tone1, tone2 } <= 30'd0;
@@ -97,7 +140,7 @@ always @(posedge clk)
                 3'b00_0: if( din[7] ) tone0[3:0]<=din[3:0]; else tone0[9:4]<=din[5:0];
                 3'b01_0: if( din[7] ) tone1[3:0]<=din[3:0]; else tone1[9:4]<=din[5:0];
                 3'b10_0: if( din[7] ) tone2[3:0]<=din[3:0]; else tone2[9:4]<=din[5:0];
-                3'b11_0: ctrl3 <= din[2:0]; //Need to update these every time.
+                3'b11_0: ctrl3 <= din[2:0];
                 3'b00_1: vol0  <= din[3:0];
                 3'b01_1: vol1  <= din[3:0];
                 3'b10_1: vol2  <= din[3:0];
@@ -105,6 +148,24 @@ always @(posedge clk)
             endcase
         end
         else clr_noise <= 1'b0;
+
+        // Savestate restore. It is last in the block so it wins. ss_wr_en only
+        // pulses while the core is frozen.
+        if( ss_wr_en ) begin
+            if( ss_addr == 3'd0 ) begin
+                tone0 <= ss_wr_data[9:0];
+                tone1 <= ss_wr_data[19:10];
+                tone2 <= ss_wr_data[29:20];
+            end
+            if( ss_addr == 3'd1 ) begin
+                vol0  <= ss_wr_data[3:0];
+                vol1  <= ss_wr_data[7:4];
+                vol2  <= ss_wr_data[11:8];
+                vol3  <= ss_wr_data[15:12];
+                regn  <= ss_wr_data[18:16];
+                ctrl3 <= ss_wr_data[21:19];
+            end
+        end
     end
 
 jt89_tone u_tone0(
@@ -114,20 +175,24 @@ jt89_tone u_tone0(
     .vol    ( vol0      ),
     .tone   ( tone0     ),
     .snd    ( ch0       ),
-    .out    (           )
+    .out    ( out0      ),
+    .ss_cnt ( ss_cnt0   ),
+    .ss_set ( ss_set    ),
+    .ss_din ( {ss_w4[8:0], ss_w3[2], ss_w2[9:0]} )
 );
 
 jt89_tone u_tone1(
     .clk    ( clk       ),
-    .rst    ( rst       ),  
+    .rst    ( rst       ),
     .clk_en ( cen_16    ),
     .vol    ( vol1      ),
     .tone   ( tone1     ),
     .snd    ( ch1       ),
-    .out    (           )
+    .out    ( out1      ),
+    .ss_cnt ( ss_cnt1   ),
+    .ss_set ( ss_set    ),
+    .ss_din ( {ss_w4[17:9], ss_w3[3], ss_w2[19:10]} )
 );
-
-wire out2;
 
 jt89_tone u_tone2(
     .clk    ( clk       ),
@@ -136,7 +201,10 @@ jt89_tone u_tone2(
     .vol    ( vol2      ),
     .tone   ( tone2     ),
     .snd    ( ch2       ),
-    .out    ( out2      )
+    .out    ( out2      ),
+    .ss_cnt ( ss_cnt2   ),
+    .ss_set ( ss_set    ),
+    .ss_din ( {ss_w4[26:18], ss_w3[4], ss_w2[29:20]} )
 );
 
 jt89_noise u_noise(
@@ -147,7 +215,10 @@ jt89_noise u_noise(
     .vol    ( vol3      ),
     .ctrl3  ( ctrl3     ),
     .tone2  ( tone2     ),
-    .snd    ( noise     )
+    .snd    ( noise     ),
+    .ss_dout( ss_noise  ),
+    .ss_set ( ss_set    ),
+    .ss_din ( {ss_wr_data[8:0], ss_w3[31:5]} )
 );
 
 endmodule
