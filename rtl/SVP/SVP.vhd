@@ -26,10 +26,26 @@ entity SVP is
 		ROM_REQ		: out std_logic;
 		ROM_ACK		: in std_logic;
 		
-		DRAM_A		: out std_logic_vector(16 downto 1);		
+		DRAM_A		: out std_logic_vector(16 downto 1);
 		DRAM_DI		: in std_logic_vector(15 downto 0);
 		DRAM_DO		: out std_logic_vector(15 downto 0);
-		DRAM_WE		: out std_logic
+		DRAM_WE		: out std_logic;
+
+		-- Savestate. 11-bit word map:
+		--   0x000-0x2FF  SSP1601 (regs, RAMA, RAMB - decoded inside SSP160x)
+		--   0x300-0x31F  PMARS 0..15, two words each (MA, DATA & CD)
+		--   0x320-0x326  interface and memory controller registers
+		--   0x3FF        DSP clock-enable phase (held in S32X.sv)
+		--   0x400-0x7FF  IRAM (1024 x 16)
+		-- SS_ACTIVE gives the IRAM/RAM ports to the stream. SS_PARKED is high
+		-- when the memory controller is at rest; CE low stops the DSP but not
+		-- this controller, so an image is only taken while SS_PARKED is high.
+		SS_ADDR		: in std_logic_vector(10 downto 0);
+		SS_RD_DATA	: out std_logic_vector(31 downto 0);
+		SS_WR_DATA	: in std_logic_vector(31 downto 0);
+		SS_WR_EN		: in std_logic;
+		SS_ACTIVE	: in std_logic;
+		SS_PARKED	: out std_logic
 	);
 end SVP;
 
@@ -104,6 +120,17 @@ architecture rtl of SVP is
 	signal IRAM_D 			: std_logic_vector(15 downto 0);
 	signal IRAM_WE 		: std_logic;
 	signal IRAM_Q 			: std_logic_vector(15 downto 0);
+
+	--Savestate
+	signal SS_SEL_IRAM	: std_logic;
+	signal SS_SEL_TOP		: std_logic;
+	signal SS_SEL_SSP		: std_logic;
+	signal SS_SSP_WR		: std_logic;
+	signal SS_TOP_WR		: std_logic;
+	signal SS_SSP_RD		: std_logic_vector(31 downto 0);
+	-- BUS_DO is a registered output; routed through this signal so the sweep
+	-- can read it back (an out port is not readable in VHDL-93).
+	signal BUS_DO_R		: std_logic_vector(15 downto 0);
 	
 	impure function GetNextMA(pmar: PMAR_r) return std_logic_vector is
 		variable displ: std_logic_vector(15 downto 0); 
@@ -170,12 +197,31 @@ begin
 	SSP_SS <= EN and not SSP_WAIT and not HALT;
 	SSP_USR01 <= "00";
 	
+	-- SS decode: 0x400+ is IRAM, 0x300-0x3FF is this level, everything below
+	-- belongs to the DSP core.
+	SS_SEL_IRAM <= SS_ADDR(10);
+	SS_SEL_TOP  <= '1' when SS_ADDR(10) = '0' and SS_ADDR(9 downto 8) = "11" else '0';
+	SS_SEL_SSP  <= '1' when SS_ADDR(10) = '0' and SS_ADDR(9 downto 8) /= "11" else '0';
+	SS_TOP_WR   <= SS_WR_EN and SS_SEL_TOP;
+	SS_SSP_WR   <= SS_WR_EN and SS_SEL_SSP;
+	BUS_DO      <= BUS_DO_R;
+
+	-- The FSM's canonical rest point (see the port comment).
+	SS_PARKED <= '1' when MAS = MAS_IDLE and SSP_ACTIVE = '0' and PMAR_ACTIVE = '0'
+	                  and MEM_WAIT = '0' and DRAM_GEN_REQ = '0' else '0';
+
 	SSP160x : entity work.SSP160x
 	port map(
 		CLK		=> CLK,
 		RST_N		=> RST_N,
 		ENABLE	=> ENABLE,
 		SS			=> SSP_SS,
+
+		SS_ADDR		=> SS_ADDR(9 downto 0),
+		SS_RD_DATA	=> SS_SSP_RD,
+		SS_WR_DATA	=> SS_WR_DATA,
+		SS_WR_EN		=> SS_SSP_WR,
+		SS_ACTIVE	=> SS_ACTIVE,
 		
 		PA			=> SSP_PA,		
 		PDI		=> SSP_PDI,
@@ -203,10 +249,39 @@ begin
 			SA <= '0';
 			CA <= '0';
 			DTACK_N <= '1';
-			BUS_DO <= (others => '0');
+			BUS_DO_R <= (others => '0');
 			HALT <= '0';
 			DRAM_GEN_REQ <= '0';
 		elsif rising_edge(CLK) then
+			-- SS restore for the signals this process drives. One driver per
+			-- signal is a VHDL rule, so the injection has to live here rather
+			-- than in a savestate process of its own.
+			if SS_TOP_WR = '1' then
+				case SS_ADDR(7 downto 0) is
+					when x"21" =>
+						XST <= SS_WR_DATA(31 downto 16);
+						DRAM_GEN_ADDR <= SS_WR_DATA(15 downto 0);
+					when x"22" =>
+						DRAM_GEN_DAT <= SS_WR_DATA(31 downto 16);
+						BUS_DO_R <= SS_WR_DATA(15 downto 0);
+					when x"23" =>
+						-- Handshake bits with the 68k (CA/SA/XST) carry real
+						-- protocol state and are restored. The in-flight
+						-- 68k-side DRAM access is not: like the DSP's own FSM
+						-- above, resuming half of a bus transaction leaves
+						-- both sides waiting. DTACK_N goes to its idle level
+						-- so the next 68k access starts clean.
+						PMC_SEL      <= SS_WR_DATA(12);
+						CA           <= SS_WR_DATA(10);
+						SA           <= SS_WR_DATA(9);
+						HALT         <= SS_WR_DATA(8);
+						DTACK_N      <= '1';
+						DRAM_GEN_REQ <= '0';
+						DRAM_GEN_WAIT<= '0';
+						DRAM_GEN_WE  <= '0';
+					when others => null;
+				end case;
+			end if;
 			if ENABLE = '1' then
 				if SSP_ESB = '1' and EN = '1' then
 					if SSP_R_NW = '0' then
@@ -259,12 +334,12 @@ begin
 						else
 							case BUS_A(3 downto 1) is
 								when "000" | "001" =>
-									BUS_DO <= XST;
+									BUS_DO_R <= XST;
 								when "010" =>
-									BUS_DO <= "00000000000000" & CA & SA;
+									BUS_DO_R <= "00000000000000" & CA & SA;
 									SA <= '0';
 								when others =>
-									BUS_DO <= (others => '0');
+									BUS_DO_R <= (others => '0');
 							end case; 
 						end if;
 						DTACK_N <= '0';
@@ -292,7 +367,7 @@ begin
 							DRAM_GEN_WAIT <= '0';
 							if DRAM_GEN_WAIT = '0' then
 								if BUS_RNW = '1' then
-									BUS_DO <= DRAM_DI;
+									BUS_DO_R <= DRAM_DI;
 								end if;
 								DTACK_N <= '0';
 								DRAM_GEN_REQ <= '0';
@@ -365,6 +440,44 @@ begin
 			PMAR_ACTIVE <= '0';
 			MEM_WAIT <= '0';
 		elsif rising_edge(CLK) then
+			-- SS restore for this process's signals (PMAR file + the memory
+			-- controller). Note MAS is rebuilt from its enumeration position,
+			-- never from raw encoding bits.
+			if SS_TOP_WR = '1' then
+				if SS_ADDR(7 downto 5) = "000" then
+					if SS_ADDR(0) = '0' then
+						PMARS(to_integer(unsigned(SS_ADDR(4 downto 1)))).MA <= SS_WR_DATA;
+					else
+						PMARS(to_integer(unsigned(SS_ADDR(4 downto 1)))).DATA <= SS_WR_DATA(31 downto 16);
+						PMARS(to_integer(unsigned(SS_ADDR(4 downto 1)))).CD   <= SS_WR_DATA(15 downto 0);
+					end if;
+				else
+					case SS_ADDR(7 downto 0) is
+						when x"20" => PMC <= SS_WR_DATA;
+						when x"23" =>
+							-- An image is only taken with the SVP parked (SS_PARKED:
+							-- memory FSM idle, no PMAR access pending, nothing in
+							-- flight), so the FSM goes back to that rest point and the
+							-- req/ack handshake to rest. SSP_ACTIVE is the recorded one:
+							-- at the park the instruction at PC has been fetched into
+							-- ROM_DATA (word 26), and forcing a refetch would delay the
+							-- DSP against the 68000 it races with.
+							MAS         <= MAS_IDLE;
+							MEM_WAIT    <= '0';
+							PMAR_ACTIVE <= '0';
+							SSP_ACTIVE  <= SS_WR_DATA(6);
+							MA_ROM_REQ  <= ROM_ACK;   -- req/ack handshake at rest
+							PMAR_NUM    <= unsigned(SS_WR_DATA(16 downto 13));
+							PMAR_SET    <= SS_WR_DATA(11);
+						when x"24" => MEM_ADDR <= SS_WR_DATA(20 downto 0);
+						when x"25" => ROM_ADDR <= SS_WR_DATA(19 downto 0);
+						when x"26" =>
+							ROM_DATA  <= SS_WR_DATA(31 downto 16);
+							DRAM_ADDR <= SS_WR_DATA(15 downto 0);
+						when others => null;
+					end case;
+				end if;
+			end if;
 			if EN = '1' then
 				SSP_ACTIVE <= '1';
 				if SSP_ESB = '1' then
@@ -509,9 +622,14 @@ begin
 	
 	
 	--IRAM
-	IRAM_ADDR <= MEM_ADDR(9 downto 0) when MAS = MAS_IRAM_RD or MAS = MAS_IRAM_WR else SSP_PA(9 downto 0);
-	IRAM_D <= PMARS(to_integer(PMAR_NUM)).DATA;
-	IRAM_WE <= '1' when MAS = MAS_IRAM_WR else '0';
+	-- SS: single-port BRAM, so the stream takes the port while frozen. Read is
+	-- registered by the block RAM, so the caller must present an address one
+	-- cycle before sampling.
+	IRAM_ADDR <= SS_ADDR(9 downto 0) when SS_ACTIVE = '1' else
+	             MEM_ADDR(9 downto 0) when MAS = MAS_IRAM_RD or MAS = MAS_IRAM_WR else SSP_PA(9 downto 0);
+	IRAM_D <= SS_WR_DATA(15 downto 0) when SS_ACTIVE = '1' else PMARS(to_integer(PMAR_NUM)).DATA;
+	IRAM_WE <= (SS_WR_EN and SS_SEL_IRAM) when SS_ACTIVE = '1' else
+	           '1' when MAS = MAS_IRAM_WR else '0';
 	IRAM : entity work.spram generic map(10, 16)
 	port map(
 		clock		=> CLK,
@@ -521,6 +639,32 @@ begin
 		q			=> IRAM_Q
 	);
 	
+	-- SS read mux. PMARS pairs: even word = MA, odd = DATA & CD.
+	SS_RD_DATA <=
+		x"0000" & IRAM_Q                                  when SS_SEL_IRAM = '1' else
+		SS_SSP_RD                                         when SS_SEL_SSP = '1' else
+		PMARS(to_integer(unsigned(SS_ADDR(4 downto 1)))).MA
+			when SS_ADDR(7 downto 5) = "000" and SS_ADDR(0) = '0' else
+		PMARS(to_integer(unsigned(SS_ADDR(4 downto 1)))).DATA &
+		PMARS(to_integer(unsigned(SS_ADDR(4 downto 1)))).CD
+			when SS_ADDR(7 downto 5) = "000" else
+		PMC                                               when SS_ADDR(7 downto 0) = x"20" else
+		XST & DRAM_GEN_ADDR                               when SS_ADDR(7 downto 0) = x"21" else
+		DRAM_GEN_DAT & BUS_DO_R                           when SS_ADDR(7 downto 0) = x"22" else
+		-- 31:20 pad | 19:17 MAS | 16:13 PMAR_NUM | 12 PMC_SEL | 11 PMAR_SET |
+		-- 10 CA | 9 SA | 8 HALT | 7 DTACK_N | 6 SSP_ACTIVE | 5 PMAR_ACTIVE |
+		-- 4 MA_ROM_REQ | 3 MEM_WAIT | 2 DRAM_GEN_REQ | 1 DRAM_GEN_WAIT | 0 WE.
+		-- MAS is an enumeration: Quartus is free to one-hot it, so it travels
+		-- as an explicit binary position, never as raw bits.
+		"000000000000" & std_logic_vector(to_unsigned(MemAccessState_t'pos(MAS), 3)) &
+		  std_logic_vector(PMAR_NUM) & PMC_SEL & PMAR_SET & CA & SA & HALT & DTACK_N &
+		  SSP_ACTIVE & PMAR_ACTIVE & MA_ROM_REQ & MEM_WAIT & DRAM_GEN_REQ &
+		  DRAM_GEN_WAIT & DRAM_GEN_WE                     when SS_ADDR(7 downto 0) = x"23" else
+		std_logic_vector(resize(unsigned(MEM_ADDR), 32))  when SS_ADDR(7 downto 0) = x"24" else
+		std_logic_vector(resize(unsigned(ROM_ADDR), 32))  when SS_ADDR(7 downto 0) = x"25" else
+		ROM_DATA & DRAM_ADDR                              when SS_ADDR(7 downto 0) = x"26" else
+		(others => '0');
+
 	--DRAM
 	DRAM_A <= DRAM_GEN_ADDR when DRAM_GEN_REQ = '1' else DRAM_ADDR;
 	DRAM_DO <= DRAM_GEN_DAT when DRAM_GEN_REQ = '1' else OverWrite(PMARS(to_integer(PMAR_NUM)), DRAM_DI);

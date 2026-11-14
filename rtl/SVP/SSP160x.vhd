@@ -31,7 +31,26 @@ entity SSP160x is
 		BLIND_RD		: out std_logic;
 		BLIND_WR		: out std_logic;
 
-		INST_NON		: out std_logic
+		INST_NON		: out std_logic;
+
+		-- Savestate. Word map (SS_ADDR, 10 bits):
+		--   0x000        A(31:16) & A(15:0) packed as one 32-bit word
+		--   0x001        X & Y
+		--   0x002        PC & IR_SAVED
+		--   0x003        IND_ADDR & flags/status bits
+		--   0x004        STACK_POS & PREG(0..2)
+		--   0x005        PREG(3..6)
+		--   0x006        PREG(7)
+		--   0x007-0x009  STACK 0..5, two per word
+		--   0x100-0x1FF  RAMA (256 x 16, low half of each word)
+		--   0x200-0x2FF  RAMB (256 x 16)
+		-- Reads are combinational; writes land on the clock while the core is
+		-- frozen (SS_ACTIVE high, EN low), so no process needs an extra guard.
+		SS_ADDR		: in std_logic_vector(9 downto 0);
+		SS_RD_DATA	: out std_logic_vector(31 downto 0);
+		SS_WR_DATA	: in std_logic_vector(31 downto 0);
+		SS_WR_EN		: in std_logic;
+		SS_ACTIVE	: in std_logic
 	);
 end SSP160x;
 
@@ -89,6 +108,19 @@ architecture rtl of SSP160x is
 	signal RAMB_WE 		: std_logic;
 	signal RAMA_Q 			: std_logic_vector(15 downto 0);
 	signal RAMB_Q 			: std_logic_vector(15 downto 0);
+
+	-- SS: port-steal muxes for the two data RAMs (see the instantiations).
+	signal RAMA_ADDR_M	: std_logic_vector(7 downto 0);
+	signal RAMB_ADDR_M	: std_logic_vector(7 downto 0);
+	signal RAMA_D_M		: std_logic_vector(15 downto 0);
+	signal RAMB_D_M		: std_logic_vector(15 downto 0);
+	signal RAMA_WE_M		: std_logic;
+	signal RAMB_WE_M		: std_logic;
+	signal SS_RAM_SEL_A	: std_logic;
+	signal SS_RAM_SEL_B	: std_logic;
+	signal SS_REG_WR		: std_logic;   -- a register-block write this cycle
+	signal SS_W0, SS_W1, SS_W2, SS_W3, SS_W4 : std_logic;
+	signal SS_W5, SS_W6, SS_W7, SS_W8, SS_W9 : std_logic;
 
 begin
 
@@ -272,6 +304,17 @@ begin
 			IND_EXT_CYCLE <= '0';
 			IR_SAVED <= (others => '0');
 		elsif rising_edge(CLK) then
+			-- SS restore (word 2: IR_SAVED, word 3: the two extension-cycle
+			-- flags). Injected here because VHDL permits one driver per signal
+			-- and this process owns them. EN is low while the sweep runs, so
+			-- the branches below cannot race it.
+			if SS_W2 = '1' then
+				IR_SAVED <= SS_WR_DATA(15 downto 0);
+			end if;
+			if SS_W3 = '1' then
+				IMM16_EXT_CYCLE <= SS_WR_DATA(15);
+				IND_EXT_CYCLE   <= SS_WR_DATA(14);
+			end if;
 			if EN = '1' then
 				if INST.AS = IA_IMM16 and IMM16_EXT_CYCLE = '0' then 
 					IMM16_EXT_CYCLE <= '1';
@@ -407,6 +450,12 @@ begin
 			FLAG_L <= '0';
 			FLAG_OV <= '0';
 		elsif rising_edge(CLK) then
+			if SS_W3 = '1' then                      -- SS restore: ALU flags
+				FLAG_N  <= SS_WR_DATA(13);
+				FLAG_OV <= SS_WR_DATA(12);
+				FLAG_Z  <= SS_WR_DATA(11);
+				FLAG_L  <= SS_WR_DATA(10);
+			end if;
 			if EN = '1' and LAST_CYCLE = '1' then
 				if INST.IT = IT_ADD or INST.IT = IT_SUB or INST.IT = IT_AND or INST.IT = IT_OR or INST.IT = IT_EOR or 
 					INST.IT = IT_CMP or INST.IT = IT_MLD or INST.IT = IT_MPYA or INST.IT = IT_MPYS or
@@ -440,6 +489,9 @@ begin
 		if RST_N = '0' then
 			A <= (others => '0');
 		elsif rising_edge(CLK) then
+			if SS_W0 = '1' then                      -- SS restore: accumulator
+				A <= SS_WR_DATA;
+			end if;
 			if EN = '1' and LAST_CYCLE = '1' then
 				if INST.IT = IT_ADD or INST.IT = IT_SUB or INST.IT = IT_AND or INST.IT = IT_OR or INST.IT = IT_EOR or 
 					INST.IT = IT_MPYA or INST.IT = IT_MPYS or INST.IT = IT_MLD or
@@ -466,6 +518,10 @@ begin
 			X <= (others => '0');
 			Y <= (others => '0');
 		elsif rising_edge(CLK) then
+			if SS_W1 = '1' then                      -- SS restore: X, Y
+				X <= SS_WR_DATA(31 downto 16);
+				Y <= SS_WR_DATA(15 downto 0);
+			end if;
 			if EN = '1' and LAST_CYCLE = '1' then
 				if INST.IT = IT_MLD or INST.IT = IT_MPYA or INST.IT = IT_MPYS then
 					X <= RAMA_Q;
@@ -505,6 +561,23 @@ begin
 			STACK <= (others => (others => '0'));
 			STACK_POS <= (others => '0');
 		elsif rising_edge(CLK) then
+			-- SS restore: PC (word 2), STACK_POS (word 4) and the six stack
+			-- entries (words 7-9). STACK_POS is meaningless without the stack
+			-- and vice versa, so both travel.
+			if SS_W2 = '1' then PC <= SS_WR_DATA(31 downto 16); end if;
+			if SS_W4 = '1' then STACK_POS <= unsigned(SS_WR_DATA(26 downto 24)); end if;
+			if SS_W7 = '1' then
+				STACK(0) <= SS_WR_DATA(31 downto 16);
+				STACK(1) <= SS_WR_DATA(15 downto 0);
+			end if;
+			if SS_W8 = '1' then
+				STACK(2) <= SS_WR_DATA(31 downto 16);
+				STACK(3) <= SS_WR_DATA(15 downto 0);
+			end if;
+			if SS_W9 = '1' then
+				STACK(4) <= SS_WR_DATA(31 downto 16);
+				STACK(5) <= SS_WR_DATA(15 downto 0);
+			end if;
 			if EN = '1' then
 				NEXT_PC := std_logic_vector(unsigned(PC) + 1);
 				
@@ -548,6 +621,15 @@ begin
 			OP <= '0';
 			MACS <= '0';
 		elsif rising_edge(CLK) then
+			if SS_W3 = '1' then                      -- SS restore: ST fields
+				MACS <= SS_WR_DATA(9);
+				OP   <= SS_WR_DATA(8);
+				IE   <= SS_WR_DATA(7);
+				ST6  <= SS_WR_DATA(6);
+				ST5  <= SS_WR_DATA(5);
+				RB   <= SS_WR_DATA(4 downto 3);
+				RPL  <= SS_WR_DATA(2 downto 0);
+			end if;
 			if EN = '1' and LAST_CYCLE = '1' then
 				if INST.IT = IT_LD and INST.AD = IA_REGX and INST.X = REG_ST then
 					RPL <= SRC_DATA(2 downto 0);
@@ -617,6 +699,23 @@ begin
 		if RST_N = '0' then
 			PREG <= (others => (others => '0'));
 		elsif rising_edge(CLK) then
+			-- SS restore: all 8 pointer registers (words 4-6). 3 and 7 are not
+			-- used as RAM pointers but are writable and readable by the
+			-- program, so they travel too.
+			if SS_W4 = '1' then
+				PREG(0) <= SS_WR_DATA(23 downto 16);
+				PREG(1) <= SS_WR_DATA(15 downto 8);
+				PREG(2) <= SS_WR_DATA(7 downto 0);
+			end if;
+			if SS_W5 = '1' then
+				PREG(3) <= SS_WR_DATA(31 downto 24);
+				PREG(4) <= SS_WR_DATA(23 downto 16);
+				PREG(5) <= SS_WR_DATA(15 downto 8);
+				PREG(6) <= SS_WR_DATA(7 downto 0);
+			end if;
+			if SS_W6 = '1' then
+				PREG(7) <= SS_WR_DATA(31 downto 24);
+			end if;
 			if EN = '1' and LAST_CYCLE = '1' then
 				if INST.AD = IA_PTR or INST.AS = IA_PTR then
 					if INST.RAM(0) = '1' then
@@ -677,6 +776,9 @@ begin
 		if RST_N = '0' then
 			IND_ADDR <= (others => '0');
 		elsif rising_edge(CLK) then
+			if SS_W3 = '1' then                      -- SS restore: IND_ADDR
+				IND_ADDR <= SS_WR_DATA(31 downto 16);
+			end if;
 			if EN = '1' and LAST_CYCLE = '0' then
 				if INST.AS = IA_INDPTR then
 					if INST.RAM(0) = '1' then
@@ -694,26 +796,40 @@ begin
 	RAMA_ADDR <= IR(7 downto 0) when INST.AS = IA_RAM or INST.AD = IA_RAM else RAMA_PTR;
 	RAMA_D <= std_logic_vector(unsigned(RAMA_Q) + 1) when INST.AS = IA_INDPTR else SRC_DATA;
 	RAMA_WE <= INST.RAM(0) and LAST_CYCLE and EN when INST.AD = IA_RAM or INST.AD = IA_PTR or INST.AS = IA_INDPTR else '0';
+	-- SS: the mlab has independent read and write address ports (they are tied
+	-- to the same signal in normal operation), so the sweep steals both while
+	-- the core is frozen. Read is asynchronous, hence SS_RAMA_Q is valid in the
+	-- same cycle as SS_ADDR.
+	SS_RAM_SEL_A <= '1' when SS_ADDR(9 downto 8) = "01" else '0';
+	SS_RAM_SEL_B <= '1' when SS_ADDR(9 downto 8) = "10" else '0';
+	RAMA_ADDR_M <= SS_ADDR(7 downto 0) when SS_ACTIVE = '1' else RAMA_ADDR;
+	RAMA_D_M    <= SS_WR_DATA(15 downto 0) when SS_ACTIVE = '1' else RAMA_D;
+	RAMA_WE_M   <= (SS_WR_EN and SS_RAM_SEL_A) when SS_ACTIVE = '1' else RAMA_WE;
+
 	RAMA : entity work.mlab generic map(8, 16)
 	port map(
 		clock			=> CLK,
-		rdaddress	=> RAMA_ADDR,
-		wraddress	=> RAMA_ADDR,
-		data			=> RAMA_D,
-		wren			=> RAMA_WE,
+		rdaddress	=> RAMA_ADDR_M,
+		wraddress	=> RAMA_ADDR_M,
+		data			=> RAMA_D_M,
+		wren			=> RAMA_WE_M,
 		q				=> RAMA_Q
 	);
 	
 	RAMB_ADDR <= IR(7 downto 0) when INST.AS = IA_RAM or INST.AD = IA_RAM else RAMB_PTR;
 	RAMB_D <= std_logic_vector(unsigned(RAMB_Q) + 1) when INST.AS = IA_INDPTR else SRC_DATA;
 	RAMB_WE <= INST.RAM(1) and LAST_CYCLE and EN when INST.AD = IA_RAM or INST.AD = IA_PTR or INST.AS = IA_INDPTR else '0';
+	RAMB_ADDR_M <= SS_ADDR(7 downto 0) when SS_ACTIVE = '1' else RAMB_ADDR;
+	RAMB_D_M    <= SS_WR_DATA(15 downto 0) when SS_ACTIVE = '1' else RAMB_D;
+	RAMB_WE_M   <= (SS_WR_EN and SS_RAM_SEL_B) when SS_ACTIVE = '1' else RAMB_WE;
+
 	RAMB : entity work.mlab generic map(8, 16)
 	port map(
 		clock			=> CLK,
-		rdaddress	=> RAMB_ADDR,
-		wraddress	=> RAMB_ADDR,
-		data			=> RAMB_D,
-		wren			=> RAMB_WE,
+		rdaddress	=> RAMB_ADDR_M,
+		wraddress	=> RAMB_ADDR_M,
+		data			=> RAMB_D_M,
+		wren			=> RAMB_WE_M,
 		q				=> RAMB_Q
 	);
 
@@ -731,6 +847,50 @@ begin
 	BLIND_WR <= '1' when (INST.AS = IA_REGX and INST.X = REG_0) or (INST.AS = IA_REGY and INST.Y = REG_0) else '0';	--therefore added extern signals 
 	
 	ST56 <= ST6 & ST5;
-	
+
+	------------------------------------------------------------------------
+	-- Savestate
+	------------------------------------------------------------------------
+	-- P, SP, ST and IR are not saved: they are combinational (P = X*Y*2,
+	-- SP = STACK(STACK_POS-1), ST = the concat of the flag flops, IR = a mux
+	-- of PDI and IR_SAVED). Writing them is impossible - there is no flop -
+	-- and restoring their sources reproduces them exactly.
+	-- Words 0-9 only: the strobes below decode SS_ADDR(3 downto 0), so the rest of the
+	-- 256-word block (which reads 0) must not write, or its aliases zero the registers.
+	SS_REG_WR <= SS_WR_EN when SS_ADDR(9 downto 4) = "000000" else '0';
+
+	SS_RD_DATA <=
+		A                                                     when SS_ADDR = "0000000000" else
+		X & Y                                                 when SS_ADDR = "0000000001" else
+		PC & IR_SAVED                                         when SS_ADDR = "0000000010" else
+		IND_ADDR & IMM16_EXT_CYCLE & IND_EXT_CYCLE &
+		  FLAG_N & FLAG_OV & FLAG_Z & FLAG_L &
+		  MACS & OP & IE & ST6 & ST5 & RB & RPL               when SS_ADDR = "0000000011" else
+		"00000" & std_logic_vector(STACK_POS) &
+		  PREG(0) & PREG(1) & PREG(2)                         when SS_ADDR = "0000000100" else
+		PREG(3) & PREG(4) & PREG(5) & PREG(6)                 when SS_ADDR = "0000000101" else
+		PREG(7) & "000000000000000000000000"                  when SS_ADDR = "0000000110" else
+		STACK(0) & STACK(1)                                   when SS_ADDR = "0000000111" else
+		STACK(2) & STACK(3)                                   when SS_ADDR = "0000001000" else
+		STACK(4) & STACK(5)                                   when SS_ADDR = "0000001001" else
+		x"0000" & RAMA_Q                                      when SS_ADDR(9 downto 8) = "01" else
+		x"0000" & RAMB_Q                                      when SS_ADDR(9 downto 8) = "10" else
+		(others => '0');
+
+	-- Per-word restore strobes. VHDL allows exactly one driver per signal, so
+	-- each write is performed inside the process that already owns the target
+	-- register (see the SS branches added at the head of each clocked process
+	-- below); these decodes are what those branches test.
+	SS_W0 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0000" else '0';
+	SS_W1 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0001" else '0';
+	SS_W2 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0010" else '0';
+	SS_W3 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0011" else '0';
+	SS_W4 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0100" else '0';
+	SS_W5 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0101" else '0';
+	SS_W6 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0110" else '0';
+	SS_W7 <= SS_REG_WR when SS_ADDR(3 downto 0) = "0111" else '0';
+	SS_W8 <= SS_REG_WR when SS_ADDR(3 downto 0) = "1000" else '0';
+	SS_W9 <= SS_REG_WR when SS_ADDR(3 downto 0) = "1001" else '0';
+
 end rtl;
 
