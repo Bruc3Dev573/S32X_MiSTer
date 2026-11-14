@@ -398,6 +398,7 @@ wire        GEN_HBLANK;
 
 //wire [15:0] GEN_MEM_DO;
 wire        GEN_MEM_BUSY;
+wire        GEN_VBUS_DMA;
 
 wire [7:0] color_lut[16] = '{
 	8'd0,   8'd27,  8'd49,  8'd71,
@@ -501,6 +502,8 @@ gen gen
 	.OBJ_LIMIT_HIGH(status[31]),
 
 	.MEM_RDY(~GEN_MEM_BUSY),
+	.VBUS_DMA(GEN_VBUS_DMA),
+	.ROM_DMA_DEC(svp_quirk),
 	.GG_RESET(code_download && ioctl_wr && !ioctl_addr),
 	.GG_EN(status[24]),
 	.GG_CODE({~gg_code[95] & gg_code[128], gg_code[127:0]}),
@@ -514,12 +517,15 @@ gen gen
 	.SPR_GRID_EN(VDP_SPR_GRID_EN)
 );
 
-assign GEN_MEM_BUSY = !GEN_RAS2_N                  ? 1'b0 : 
+// The SVP DRAM sits in the RAS2 area, which otherwise answers at once: its accesses wait
+// for the SVP's DTACK.
+assign GEN_MEM_BUSY = svp_dram_area               ? 1'b1 :
+                      !GEN_RAS2_N                  ? 1'b0 : 
                       CART_SRAM_RD || CART_SRAM_WR ? sdr_busy[2] : 
 							                                sdr_busy[1];
 
-assign GEN_VDI = s32x_rom ? S32X_VDO : CART_VDO;
-assign GEN_DTACK_N = S32X_DTACK_N & CART_DTACK_N;
+assign GEN_VDI = (svp_reg_area | svp_dram_area) ? SVP_BUS_DO : s32x_rom ? S32X_VDO : CART_VDO;
+assign GEN_DTACK_N = S32X_DTACK_N & CART_DTACK_N & SVP_DTACK_N;
 
 // 32X
 wire [23:1] S32X_CA;
@@ -692,12 +698,96 @@ CART cart
 	.rom_sz(rom_sz),
 	.s32x(s32x_rom),
 	.eeprom_map(eeprom_map),
-	.noram_quirk(noram_quirk),
+	.noram_quirk(noram_quirk | svp_quirk), // the SVP DRAM is where SRAM would be
 	.realtec_map(realtec_map),
 	.sf_map(sf_map)
 );
 assign CART_ROM_DI = sdr_do[1];
 assign CART_SRAM_DI = sdr_do[2][7:0];
+
+// SVP (Virtua Racing). The SSP1601 and its interface answer on the Mega Drive bus:
+// registers at A15000-A1500F, DRAM at 300000-37FFFF and its two cell-arranged views at
+// 390000 and 3A0000. With a Mega Drive cartridge the 32X passes that bus through
+// unchanged, so the SVP takes it straight from gen, off the SH-2 paths. Its 128KB DRAM is
+// framebuffer 1, which a Mega Drive cartridge leaves to no one. Its program reads take
+// SDRAM channel 0, which the 32X SDRAM (in DDR3) leaves free.
+wire svp_reg_area  = svp_quirk && GEN_VA[23:4] == 20'hA1500;
+wire svp_dram_area = svp_quirk && (GEN_VA[23:19] == 5'b00110 || GEN_VA[23:16] == 8'h39 || GEN_VA[23:16] == 8'h3A);
+
+wire [15:0] SVP_BUS_DO;
+wire        SVP_DTACK_N;
+wire [20:1] SVP_ROM_A;
+wire        SVP_ROM_REQ;
+wire [15:0] SVP_DRAM_A;
+wire [15:0] SVP_DRAM_DO;
+wire        SVP_DRAM_WE;
+
+// The enable is low while the SVP is in reset, so the first clock after it never enables
+// the DSP (as SVP_CLKEN in the Genesis core). On that clock the program fetch of 400h
+// starts; an enable there would execute the empty instruction register and advance PC,
+// leaving the fetches one word behind PC: the boot code then misses its wait for the
+// 68000 and Virtua Racing stops at "Communication Error" with a black screen.
+reg  svp_ce_ph = 0;
+always @(posedge clk_sys) begin
+	if(!svp_quirk || reset || rom_download) svp_ce_ph <= 0;
+	else svp_ce_ph <= ~svp_ce_ph;
+end
+
+SVP svp
+(
+	.CLK(clk_sys),
+	.CE(svp_ce_ph),
+	.RST_N(~(reset | rom_download) & svp_quirk),
+	.ENABLE(1'b1),
+
+	.BUS_A(GEN_VA),
+	.BUS_DO(SVP_BUS_DO),
+	.BUS_DI(GEN_VDO),
+	.BUS_SEL(svp_quirk & (~GEN_CAS0_N | ~GEN_LWR_N | ~GEN_UWR_N)),
+	.BUS_RNW(GEN_LWR_N & GEN_UWR_N),
+	.BUS_DTACK_N(SVP_DTACK_N),
+	.DMA_ACTIVE(GEN_VBUS_DMA),
+
+	.ROM_A(SVP_ROM_A),
+	.ROM_DI(svp_rom_q),
+	.ROM_REQ(SVP_ROM_REQ),
+	.ROM_ACK(svp_rom_ack),
+
+	.DRAM_A(SVP_DRAM_A),
+	.DRAM_DI(S32X_FB1_DI),
+	.DRAM_DO(SVP_DRAM_DO),
+	.DRAM_WE(SVP_DRAM_WE)
+);
+
+// Program reads: one SDRAM read per toggle of ROM_REQ; ROM_ACK toggles back with the data.
+reg  [20:1] svp_rom_a_l;
+reg  [15:0] svp_rom_q;
+reg         svp_rom_ack = 0;
+reg         svp_rom_rd = 0;
+reg   [1:0] svp_rom_st = 0;
+always @(posedge clk_sys) begin
+	if(!svp_quirk || reset) begin
+		svp_rom_st <= 0; svp_rom_rd <= 0; svp_rom_ack <= SVP_ROM_REQ;
+	end else case(svp_rom_st)
+		2'd0: if(SVP_ROM_REQ != svp_rom_ack) begin
+			svp_rom_a_l <= SVP_ROM_A;
+			svp_rom_rd  <= 1;
+			svp_rom_st  <= 2'd1;
+		end
+		// The controller took the request (busy rises): drop the strobe.
+		2'd1: if(sdr_busy[0]) begin
+			svp_rom_rd <= 0;
+			svp_rom_st <= 2'd2;
+		end
+		// dout is valid as busy falls.
+		2'd2: if(!sdr_busy[0]) begin
+			svp_rom_q   <= sdr_do[0];
+			svp_rom_ack <= ~svp_rom_ack;
+			svp_rom_st  <= 2'd0;
+		end
+		default: svp_rom_st <= 2'd0;
+	endcase
+end
 
 always @(posedge clk_sys) begin
 	reg old_busy;
@@ -706,8 +796,6 @@ always @(posedge clk_sys) begin
 	if(rom_download & ioctl_wr) ioctl_wait <= 1;
 	if(old_busy & ~sdr_busy[3]) ioctl_wait <= 0;
 end
-
-reg use_sdr = 0;
 
 wire ddr_busy;
 wire [15:0] ddr_do;
@@ -736,12 +824,12 @@ sdram sdram
 	.init(~locked),
 	.clk(clk_ram),
 
-	//SDRAM
-	.addr0({8'b10000000,S32X_SDR_A}), // 2000000-203FFFF
-	.din0(S32X_SDR_DO),
+	//SVP program reads (the 32X SDRAM is in DDR3)
+	.addr0({5'b00000,svp_rom_a_l}),
+	.din0(16'd0),
 	.dout0(sdr_do[0]),
-	.rd0(use_sdr & S32X_SDR_CS & S32X_SDR_RD),
-	.wr0(S32X_SDR_WE & {2{use_sdr & S32X_SDR_CS}}),
+	.rd0(svp_rom_rd),
+	.wr0(2'b00),
 	.busy0(sdr_busy[0]),
 
 	//CART ROM
@@ -836,21 +924,26 @@ spram #(16,8) vdp_fb0_u
 
 `endif
 
+// With an SVP cartridge FB1 is the SVP DRAM.
+wire [15:0] fb1_a  = svp_quirk ? SVP_DRAM_A : S32X_FB1_A;
+wire [15:0] fb1_d  = svp_quirk ? SVP_DRAM_DO : S32X_FB1_DO;
+wire  [1:0] fb1_we = svp_quirk ? {2{SVP_DRAM_WE}} : S32X_FB1_WE;
+
 spram #(16,8) vdp_fb1_l
 (
 	.clock(clk_sys),
-	.address(S32X_FB1_A),
-	.data(S32X_FB1_DO[7:0]),
-	.wren(S32X_FB1_WE[0]),
+	.address(fb1_a),
+	.data(fb1_d[7:0]),
+	.wren(fb1_we[0]),
 	.q(S32X_FB1_DI[7:0])
 );
 
 spram #(16,8) vdp_fb1_u
 (
 	.clock(clk_sys),
-	.address(S32X_FB1_A),
-	.data(S32X_FB1_DO[15:8]),
-	.wren(S32X_FB1_WE[1]),
+	.address(fb1_a),
+	.data(fb1_d[15:8]),
+	.wren(fb1_we[1]),
 	.q(S32X_FB1_DI[15:8])
 );
 

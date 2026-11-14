@@ -76,6 +76,8 @@ module BA
 	input         VBUS_BGACK_N,
 	
 	input         MEM_RDY,
+	// SVP cartridge: its bus buffer makes VDP DMA from the ROM (000000-1FFFFF) read one word behind.
+	input         ROM_DMA_DEC,
 	input         PAUSE_EN,
 	
 	output reg [7:0] DBG_Z80_HOOK
@@ -321,7 +323,7 @@ module BA
 					end
 					else if (VBUS_SEL && VDP_MBUS_DTACK_N) begin
 						msrc <= MSRC_VDP;
-						MBUS_A <= VBUS_A;
+						MBUS_A <= VBUS_A - (ROM_DMA_DEC && VBUS_A[23:21] == 3'b000);
 						//MBUS_DO <= 0;
 						MBUS_AS_N <= 0;
 						MBUS_UDS_N <= 0;
