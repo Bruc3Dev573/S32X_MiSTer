@@ -64,7 +64,13 @@ module sdram
 	input      [ 1:0] wr3,
 	input      [15:0] din3,
 	output reg [15:0] dout3,
-	output            busy3
+	output            busy3,
+
+	// Savestate: the refresh timer sets the access latencies the CPUs see, so a resume
+	// puts it back at its phase of the park. ss_rfs_set loads ss_rfs_val.
+	output     [ 9:0] ss_rfs_cur,
+	input             ss_rfs_set,
+	input      [ 9:0] ss_rfs_val
 );
 
 assign SDRAM_nCS = 0;
@@ -106,9 +112,11 @@ reg  [1:0] ch_wr[4];
 
 localparam [9:0] RFS_CNT = 766;
 
+reg  [9:0] rfs_timer = 0;
+assign ss_rfs_cur = rfs_timer;
+
 // access manager
 always @(posedge clk) begin
-	reg  [9:0] rfs_timer = 0;
 	reg  [3:0] old_rd, old_wr;
 	reg [15:0] dout;
 	reg        data_out = 0;
@@ -116,11 +124,19 @@ always @(posedge clk) begin
 	old_rd <= old_rd & rd;
 	old_wr <= old_wr & wr;
 
-	if(rfs_timer) rfs_timer <= rfs_timer - 1'd1;
+	if(ss_rfs_set) rfs_timer <= ss_rfs_val;
+	else if(rfs_timer) rfs_timer <= rfs_timer - 1'd1;
 	
 	if ((~old_rd[0] && rd[0]) || (~old_wr[0] && wr[0])) begin ch_req[0] <= 1; ch_pend[0] <= 1; ch_addr[0] <= addr0; ch_din[0] <= din0; ch_wr[0] <= wr0; end
-	if ((~old_rd[1] && rd[1]) || (~old_wr[1] && wr[1])) begin ch_req[1] <= 1; ch_pend[1] <= 1; ch_addr[1] <= addr1; ch_din[1] <= din1; ch_wr[1] <= wr1; end
-	if ((~old_rd[2] && rd[2]) || (~old_wr[2] && wr[2])) begin ch_req[2] <= 1; ch_pend[2] <= 1; ch_addr[2] <= addr2; ch_din[2] <= din2; ch_wr[2] <= wr2; end
+	// Channels 1 and 2 (cart ROM and SRAM) take address and data on every clock they are
+	// free rather than on the request edge: the edge decodes the SH-2 address, and as the
+	// enable of these registers it made the critical clk_ram paths. They still hold the
+	// values of the edge clock, as no master starts a request before the previous one's
+	// busy drops.
+	if ((~old_rd[1] && rd[1]) || (~old_wr[1] && wr[1])) begin ch_req[1] <= 1; ch_pend[1] <= 1; ch_wr[1] <= wr1; end
+	if (~ch_req[1]) begin ch_addr[1] <= addr1; ch_din[1] <= din1; end
+	if ((~old_rd[2] && rd[2]) || (~old_wr[2] && wr[2])) begin ch_req[2] <= 1; ch_pend[2] <= 1; ch_wr[2] <= wr2; end
+	if (~ch_req[2]) begin ch_addr[2] <= addr2; ch_din[2] <= din2; end
 	if ((~old_rd[3] && rd[3]) || (~old_wr[3] && wr[3])) begin ch_req[3] <= 1; ch_pend[3] <= 1; ch_addr[3] <= addr3; ch_din[3] <= din3; ch_wr[3] <= wr3; end
 
 	if(state == STATE_IDLE && mode == MODE_NORMAL) begin

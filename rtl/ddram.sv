@@ -41,8 +41,46 @@ module ddram
 	input  [15: 0] ramh_din,
 	input          ramh_rd,
 	input  [ 1: 0] ramh_wr,
-	output         ramh_busy
+	output         ramh_busy,
+
+	// Savestate channel, one 64-bit word per request, at the full DDRAM address.
+	// ss_req toggles in another clock domain; ss_addr, ss_we and ss_din are stable
+	// until ss_ack toggles back to match it. ss_dout is valid when it does.
+	input          ss_req,
+	input          ss_we,
+	input  [28: 0] ss_addr,
+	input  [63: 0] ss_din,
+	output reg [63: 0] ss_dout,
+	output reg     ss_ack = 0,
+
+	// Savestate access to the 32X SDRAM itself, one 32-bit word {word 2n, word 2n+1}
+	// per request (ssm_addr is the longword index). Same toggle handshake as ss_req.
+	// A write also updates the block RAM copy of the low 32KB and drops the read cache,
+	// so the SH-2 side sees the loaded contents. Used only while the SH-2s are parked.
+	// With ssm_cache set the request is for word ssm_addr[4:2] of the read cache state
+	// instead (see ssc_word below), answered without a DDR3 access. A load keeps the
+	// written words aside; the write of the last SDRAM longword (FFFFh) puts them back
+	// and refetches the valid lines, so the cache hits and misses as it did at the save.
+	input          ssm_req,
+	input          ssm_we,
+	input          ssm_cache,
+	input  [17: 2] ssm_addr,
+	input  [31: 0] ssm_din,
+	output reg [31: 0] ssm_dout,
+	output reg     ssm_ack = 0
 );
+
+reg  [  1:  0] ssm_req_s = 0;
+always @(posedge clk) ssm_req_s <= {ssm_req_s[0], ssm_req};
+wire           ssm_pend = (ssm_req_s[1] != ssm_ack);
+
+// Low 32KB copy: two 16-bit writes per loaded word, after the DDR3 write is issued.
+reg            ssm_mir = 0;
+reg            ssm_mir_sel = 0;
+
+reg  [  1:  0] ss_req_s = 0;
+always @(posedge clk) ss_req_s <= {ss_req_s[0], ss_req};
+wire           ss_pend = (ss_req_s[1] != ss_ack);
 
 reg  [ 26:  1] ram_address;
 reg  [ 63:  0] ram_din;
@@ -58,6 +96,29 @@ reg            ramh_rcache_busy;
 reg            ramh_read_busy[4];
 reg  [  1:  0] ramh_rcache_curr;
 reg  [  1:  0] ramh_rcache_lru[4];
+
+// Read cache state for savestates. Word 0: {present, 17'd0, valid[3:0], curr, lru[3..0]},
+// words 1-4: the address register of line 0-3. A load fills ssc_* and restores from
+// them once the SDRAM contents are back (ssc_fill steps through the lines).
+reg  [ 17:  1] ssc_addr[4];
+reg  [  3:  0] ssc_valid;
+reg  [  1:  0] ssc_curr;
+reg  [  7:  0] ssc_lru;
+reg            ssc_present = 0;
+reg            ssc_restore = 0;
+reg  [  2:  0] ssc_fill = 0;
+reg  [ 31:  0] ssc_word;
+always_comb begin
+	case (ssm_addr[4:2])
+		3'd0: ssc_word = {1'b1, 17'd0, ~ramh_rcache_dirty[3], ~ramh_rcache_dirty[2], ~ramh_rcache_dirty[1], ~ramh_rcache_dirty[0],
+		                  ramh_rcache_curr, ramh_rcache_lru[3], ramh_rcache_lru[2], ramh_rcache_lru[1], ramh_rcache_lru[0]};
+		3'd1: ssc_word = {15'd0, ramh_rcache_addr[0]};
+		3'd2: ssc_word = {15'd0, ramh_rcache_addr[1]};
+		3'd3: ssc_word = {15'd0, ramh_rcache_addr[2]};
+		3'd4: ssc_word = {15'd0, ramh_rcache_addr[3]};
+		default: ssc_word = 32'd0;
+	endcase
+end
 
 reg  [  2:  0] state = 0;
 
@@ -91,15 +152,46 @@ assign {ramh_write_addr,ramh_write_be,ramh_write_data} = ramh_fifo_dout;
 
 wire           ramh_ram_sel = !ramh_addr[17:15];
 wire [ 15:  0] ramh_ram_q;
-ddr_ram #(14) ramh_ram (clk, ramh_addr[14:1], ramh_din, ramh_wr & {2{ramh_ram_sel}}, ramh_addr[14:1], ramh_ram_q);
+wire [ 13:  0] mir_wa = ssm_mir ? {ssm_addr[14:2], ssm_mir_sel} : ramh_addr[14:1];
+wire [ 15:  0] mir_d  = ssm_mir ? (ssm_mir_sel ? ssm_din[15:0] : ssm_din[31:16]) : ramh_din;
+wire [  1:  0] mir_we = ssm_mir ? 2'b11 : ramh_wr & {2{ramh_ram_sel}};
+ddr_ram #(14) ramh_ram (clk, mir_wa, mir_d, mir_we, ramh_addr[14:1], ramh_ram_q);
 
 always @(posedge clk) begin
 	bit write,read,burst_read;
 	bit [3:0] chan;
 	bit [6:0] word_cnt;
 
+	// Read cache restore after a load. It sits before the SH-2 hit/miss and write logic
+	// below, which take priority (the SH-2s are parked anyway), so it stays off their
+	// address-to-tag paths. ssc_restore puts the tags and LRU back, then the lines are
+	// restored one at a time, each valid one refetched into its own slot (the fill writes
+	// at ramh_rcache_curr), then curr.
+	if (ssc_restore) begin
+		{ramh_rcache_addr[0], ramh_rcache_addr[1], ramh_rcache_addr[2], ramh_rcache_addr[3]} <=
+			{ssc_addr[0], ssc_addr[1], ssc_addr[2], ssc_addr[3]};
+		{ramh_rcache_lru[3], ramh_rcache_lru[2], ramh_rcache_lru[1], ramh_rcache_lru[0]} <= ssc_lru;
+		ssc_restore <= 0;
+		ssc_fill    <= 3'd1;
+	end
+	else if (ssc_fill != 0 && state == 0 && !(ramh_read_busy[0] | ramh_read_busy[1] | ramh_read_busy[2] | ramh_read_busy[3])) begin
+		if (ssc_fill == 3'd5) begin
+			ramh_rcache_curr <= ssc_curr;
+			ssc_fill <= 0;
+		end else begin
+			if (ssc_valid[ssc_fill[1:0] - 2'd1]) begin
+				ramh_rcache_curr <= ssc_fill[1:0] - 2'd1;
+				ramh_read_busy[ssc_fill[1:0] - 2'd1] <= 1;
+				ramh_rcache_dirty[ssc_fill[1:0] - 2'd1] <= 0;
+			end
+			ssc_fill <= ssc_fill + 3'd1;
+		end
+	end
+
 	{ramh_rcache_busy} <= '0;
 	if (rst_pulse) begin		
+		ssc_restore <= 0;
+		ssc_fill <= 0;
 		{ramh_rcache_dirty[0],ramh_rcache_dirty[1],ramh_rcache_dirty[2],ramh_rcache_dirty[3]} <= '1;
 		{ramh_read_busy[0],ramh_read_busy[1],ramh_read_busy[2],ramh_read_busy[3]} <= '0;
 		ramh_rcache_curr <= 2'd0;
@@ -172,10 +264,33 @@ always @(posedge clk) begin
 		end
 	end
 	
+	if (ssm_mir) begin
+		ssm_mir_sel <= ~ssm_mir_sel;
+		if (ssm_mir_sel) ssm_mir <= 0;
+	end
+
 	if (rst_pulse) begin
 		state <= '0;
 		ram_write <= 0;
 		ram_read  <= 0;
+	end
+	else if (state == 3'h4) begin
+		// Savestate read, burst of one.
+		if (!DDRAM_BUSY) ram_read <= 0;
+		if (DDRAM_DOUT_READY) begin
+			ss_dout <= DDRAM_DOUT;
+			ss_ack  <= ~ss_ack;
+			state   <= 0;
+		end
+	end
+	else if (state == 3'h6) begin
+		// Savestate read of the 32X SDRAM.
+		if (!DDRAM_BUSY) ram_read <= 0;
+		if (DDRAM_DOUT_READY) begin
+			ssm_dout <= ssm_addr[2] ? DDRAM_DOUT[31:0] : DDRAM_DOUT[63:32];
+			ssm_ack  <= ~ssm_ack;
+			state    <= 0;
+		end
 	end
 	else if(!DDRAM_BUSY) begin
 		ram_write <= 0;
@@ -237,10 +352,69 @@ always @(posedge clk) begin
 					word_cnt    <= '0;
 					state       <= 3'h2;
 				end
+				else if (ss_pend) begin
+					ram_be      <= 8'hFF;
+					ram_din     <= ss_din;
+					ram_burst   <= 1;
+					ram_chan    <= 4'd1;
+					if (ss_we) begin
+						ram_write <= 1;
+						state     <= 3'h3;
+					end else begin
+						ram_read  <= 1;
+						state     <= 3'h4;
+					end
+				end
+				else if (ssm_pend && ssm_cache) begin
+					if (!ssm_we) ssm_dout <= ssc_word;
+					else case (ssm_addr[4:2])
+						3'd0: {ssc_present, ssc_valid, ssc_curr, ssc_lru} <= {ssm_din[31], ssm_din[13:0]};
+						3'd1: ssc_addr[0] <= ssm_din[16:0];
+						3'd2: ssc_addr[1] <= ssm_din[16:0];
+						3'd3: ssc_addr[2] <= ssm_din[16:0];
+						3'd4: ssc_addr[3] <= ssm_din[16:0];
+						default: ;
+					endcase
+					ssm_ack <= ~ssm_ack;
+				end
+				else if (ssm_pend) begin
+					ram_address <= {9'b000000000,ssm_addr[17:3],2'b00};
+					ram_be      <= ssm_addr[2] ? 8'h0F : 8'hF0;
+					ram_din     <= {ssm_din, ssm_din};
+					ram_burst   <= 1;
+					ram_chan    <= 4'd2;
+					if (ssm_we) begin
+						ram_write <= 1;
+						ssm_mir   <= !ssm_addr[17:15];
+						ssm_mir_sel <= 0;
+						{ramh_rcache_dirty[0],ramh_rcache_dirty[1],ramh_rcache_dirty[2],ramh_rcache_dirty[3]} <= '1;
+						// Last longword of a load: the read cache state goes back.
+						if (&ssm_addr && ssc_present) begin
+							ssc_present <= 0;
+							ssc_restore <= 1;
+						end
+						state     <= 3'h5;
+					end else begin
+						ram_read  <= 1;
+						state     <= 3'h6;
+					end
+				end
 			end
 
 			3'h1: begin
 				state <= 0;
+			end
+
+			// Savestate write accepted.
+			3'h3: begin
+				ss_ack <= ~ss_ack;
+				state  <= 0;
+			end
+
+			// Savestate SDRAM write accepted.
+			3'h5: begin
+				ssm_ack <= ~ssm_ack;
+				state   <= 0;
 			end
 		
 			3'h2: if (DDRAM_DOUT_READY) begin
@@ -276,7 +450,7 @@ end
 assign DDRAM_CLK      = clk;
 assign DDRAM_BURSTCNT = ram_burst;
 assign DDRAM_BE       = ram_be;
-assign DDRAM_ADDR     = {5'b00110, ram_address[26:3]}; // RAM at 0x30000000
+assign DDRAM_ADDR     = (ram_chan == 4'd1) ? ss_addr : {5'b00110, ram_address[26:3]}; // RAM at 0x30000000
 assign DDRAM_RD       = ram_read;
 assign DDRAM_DIN      = ram_din;
 assign DDRAM_WE       = ram_write;
