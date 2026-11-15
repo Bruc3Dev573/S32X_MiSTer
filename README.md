@@ -21,7 +21,6 @@ F1-F3 no longer change the region and F4 no longer hides the 32X layer. Set the 
 
 A state holds both Mega Drive CPUs, the sound chips, the VDP, both SH-2s, the 32X VDP and PWM, its framebuffers and SDRAM, the cartridge SRAM or EEPROM and the mapper registers. Load a state with the same game and region you saved it with.
 
-- While a state is saved or loaded the 32X picture shows garbage for a few frames; the game redraws it.
 - A save waits until every CPU can stop between bus cycles. If that doesn't happen within about three seconds, the save is dropped.
 - Sega Channel cartridges that write to their ROM area (Game no Kanzume Otokuyou) keep the first 4 MB of that memory in the slot. If the game maps a bank at 4 MB or above, savestates are refused until the next reset.
 - Slots saved by a version of this core with a different state layout are refused.

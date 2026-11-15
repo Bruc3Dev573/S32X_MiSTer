@@ -43,7 +43,7 @@ module SH7604_CACHE (
 
 	import SH7604_PKG::*;
 	
-	// Verilator ignores translate_off, so it skips this SIM define and builds the synthesis path.
+	// Skipped under Verilator, which ignores translate_off: it builds the synthesis path.
 `ifndef VERILATOR
 	// synopsys translate_off
 	`define SIM

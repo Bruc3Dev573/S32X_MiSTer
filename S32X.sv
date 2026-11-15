@@ -310,7 +310,6 @@ reg  [17:2] ss_ssm_addr;
 reg  [31:0] ss_ssm_din;
 wire [31:0] ss_ssm_dout;
 wire        ss_ssm_ack;
-wire        ss_fb_own;
 wire [15:0] ss_fb_addr;
 wire        ss_fb_we;
 
@@ -1152,16 +1151,14 @@ always @(posedge clk_sys) begin
 	if(ss_sys_wr_en && ss_sys_addr == 3'd6) ss_rfs_park <= ss_state_dout[13:4];
 end
 
-// The framebuffers are one savestate region: word N is {FB1[N], FB0[N]}. The stream
-// takes the ports only while everything is parked; scanout then shows garbage for the
-// frames of the stream, which the next frames redraw. With an SVP cartridge FB1 is the
-// SVP DRAM.
-wire [15:0] fb0_a  = ss_fb_own ? ss_fb_addr : S32X_FB0_A;
-wire [15:0] fb1_a  = ss_fb_own ? ss_fb_addr : svp_quirk ? SVP_DRAM_A : S32X_FB1_A;
-wire [15:0] fb0_d  = ss_fb_own ? ss_state_dout[15:0]  : S32X_FB0_DO;
-wire [15:0] fb1_d  = ss_fb_own ? ss_state_dout[31:16] : svp_quirk ? SVP_DRAM_DO : S32X_FB1_DO;
-wire  [1:0] fb0_we = ss_fb_own ? {2{ss_fb_we}} : S32X_FB0_WE;
-wire  [1:0] fb1_we = ss_fb_own ? {2{ss_fb_we}} : svp_quirk ? {2{SVP_DRAM_WE}} : S32X_FB1_WE;
+// The framebuffers are one savestate region: word N is {FB1[N], FB0[N]}. Port B of each
+// framebuffer belongs to the stream, so scanout keeps reading port A: a save leaves the
+// picture as it is, and a load shows the restored picture as it is written. With an SVP
+// cartridge FB1 is the SVP DRAM.
+wire [15:0] fb1_a  = svp_quirk ? SVP_DRAM_A : S32X_FB1_A;
+wire [15:0] fb1_d  = svp_quirk ? SVP_DRAM_DO : S32X_FB1_DO;
+wire  [1:0] fb1_we = svp_quirk ? {2{SVP_DRAM_WE}} : S32X_FB1_WE;
+wire [15:0] ss_fb0_q, ss_fb1_q;
 
 `ifdef MISTER_DUAL_SDRAM
 wire sdr2_busy;
@@ -1207,45 +1204,63 @@ sdram2 sdram2
 	.wrh2(0),
 	.busy2()
 );
+// FB0 sits in the second SDRAM here, outside the savestate ports.
+assign ss_fb0_q = S32X_FB0_DI;
 
 `else
 
-spram #(16,8) vdp_fb0_l
+dpram #(16,8) vdp_fb0_l
 (
 	.clock(clk_sys),
-	.address(fb0_a),
-	.data(fb0_d[7:0]),
-	.wren(fb0_we[0]),
-	.q(S32X_FB0_DI[7:0])
+	.address_a(S32X_FB0_A),
+	.data_a(S32X_FB0_DO[7:0]),
+	.wren_a(S32X_FB0_WE[0]),
+	.q_a(S32X_FB0_DI[7:0]),
+	.address_b(ss_fb_addr),
+	.data_b(ss_state_dout[7:0]),
+	.wren_b(ss_fb_we),
+	.q_b(ss_fb0_q[7:0])
 );
 
-spram #(16,8) vdp_fb0_u
+dpram #(16,8) vdp_fb0_u
 (
 	.clock(clk_sys),
-	.address(fb0_a),
-	.data(fb0_d[15:8]),
-	.wren(fb0_we[1]),
-	.q(S32X_FB0_DI[15:8])
+	.address_a(S32X_FB0_A),
+	.data_a(S32X_FB0_DO[15:8]),
+	.wren_a(S32X_FB0_WE[1]),
+	.q_a(S32X_FB0_DI[15:8]),
+	.address_b(ss_fb_addr),
+	.data_b(ss_state_dout[15:8]),
+	.wren_b(ss_fb_we),
+	.q_b(ss_fb0_q[15:8])
 );
 
 `endif
 
-spram #(16,8) vdp_fb1_l
+dpram #(16,8) vdp_fb1_l
 (
 	.clock(clk_sys),
-	.address(fb1_a),
-	.data(fb1_d[7:0]),
-	.wren(fb1_we[0]),
-	.q(S32X_FB1_DI[7:0])
+	.address_a(fb1_a),
+	.data_a(fb1_d[7:0]),
+	.wren_a(fb1_we[0]),
+	.q_a(S32X_FB1_DI[7:0]),
+	.address_b(ss_fb_addr),
+	.data_b(ss_state_dout[23:16]),
+	.wren_b(ss_fb_we),
+	.q_b(ss_fb1_q[7:0])
 );
 
-spram #(16,8) vdp_fb1_u
+dpram #(16,8) vdp_fb1_u
 (
 	.clock(clk_sys),
-	.address(fb1_a),
-	.data(fb1_d[15:8]),
-	.wren(fb1_we[1]),
-	.q(S32X_FB1_DI[15:8])
+	.address_a(fb1_a),
+	.data_a(fb1_d[15:8]),
+	.wren_a(fb1_we[1]),
+	.q_a(S32X_FB1_DI[15:8]),
+	.address_b(ss_fb_addr),
+	.data_b(ss_state_dout[31:24]),
+	.wren_b(ss_fb_we),
+	.q_b(ss_fb1_q[15:8])
 );
 
 
@@ -2015,9 +2030,8 @@ assign ss_32x_addr = 16'(ss_state_addr - SS_OFF_32X);
 // The read cache words of the adapter block belong to ddram.sv (SDRAM channel below).
 wire ss_sel_rc     = ss_sel_32x && ss_32x_addr >= 16'(S32X_PKG::SS_OFF_RC) &&
                      ss_32x_addr < 16'(S32X_PKG::SS_OFF_RC + S32X_PKG::SS_RC_SIZE);
-assign ss_fb_own   = ss_freeze_active & ss_sel_fb;
 assign ss_fb_addr  = 16'(ss_state_addr - SS_OFF_FB);
-assign ss_fb_we    = ss_state_we & ss_sel_fb;
+assign ss_fb_we    = ss_freeze_active & ss_state_we & ss_sel_fb;
 
 // Work RAM, VRAM and Z80 RAM share one port into gen.
 wire ss_sel_gen_mem = ss_sel_work_ram | ss_sel_vram | ss_sel_zram;
@@ -2249,7 +2263,7 @@ always @(posedge clk_sys) begin
 	else if(ss_sel_sdr32)
 		ss_state_din <= ss_ssm_data;
 	else if(ss_sel_fb)
-		ss_state_din <= {S32X_FB1_DI, S32X_FB0_DI};
+		ss_state_din <= {ss_fb1_q, ss_fb0_q};
 	else if(ss_sel_svp)
 		ss_state_din <= (ss_svp_addr == 11'h3FF) ? {31'd0, svp_ce_ph} : ss_svp_rd;
 	else if(ss_sel_sys)
