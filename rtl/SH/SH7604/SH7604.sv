@@ -94,8 +94,8 @@ module SH7604
 	// Savestate
 	//**********************************************************
 	// Image (32-bit words at SS_ADDR, SS_IMAGE_SIZE = 'h600), written only while parked:
-	//   000-048  flop chain, 2319 bits, MSB of word 000 first: reset sync and clock divider
-	//            (27 bits), 17 pad bits, then core, MULT, DIVU, DMAC, INTC, FRT, WDT, SCI,
+	//   000-048  flop chain, 2331 bits, MSB of word 000 first: reset sync and clock divider
+	//            (27 bits), 5 pad bits, then core, MULT, DIVU, DMAC, INTC, FRT, WDT, SCI,
 	//            UBC, MSBY, BSC, cache (the order of the SS_SI/SS_SO links below)
 	//   049-0DF  reserved (read 0)
 	//   0E0-0EF  R0-R15, 0F0 PR, 0F1-0FF reserved
@@ -109,10 +109,10 @@ module SH7604
 	// consumed by the CE_R after they load, MULT operands and the DIVU datapath, the
 	// regfile write-B latch, one-clock pulses, and what the 32X ties off or leaves
 	// unconnected (see each module).
-	// chain bits: top 27, core 755, MULT 99, DIVU 186, DMAC 374, INTC 119, FRT 78, WDT 30,
-	// SCI 100, UBC 217, MSBY 3, BSC 209 (+9 with byte areas), cache 122
-	localparam SS_BITS  = 27 + 755 + 99 + 186 + 374 + 119 + 78 + 30 + 100 + 217 + 3 +
-	                      209 + (BUS_SIZE_BYTE_DISABLE ? 0 : 9) + 122;
+	// chain bits: top 27, core 760, MULT 100, DIVU 186, DMAC 378, INTC 119, FRT 78, WDT 30,
+	// SCI 100, UBC 217, MSBY 3, BSC 211 (+9 with byte areas), cache 122
+	localparam SS_BITS  = 27 + 760 + 100 + 186 + 378 + 119 + 78 + 30 + 100 + 217 + 3 +
+	                      211 + (BUS_SIZE_BYTE_DISABLE ? 0 : 9) + 122;
 	localparam SS_WORDS = (SS_BITS + 32) / 32;
 	localparam SS_PAD   = SS_WORDS*32 - SS_BITS;
 	

@@ -32,8 +32,9 @@ A state holds both Mega Drive CPUs, the sound chips, the VDP, both SH-2s, the 32
 - Z80 refresh cycles no longer start a 68000 bus access (TiTAN Overdrive), and 68000 writes to work RAM no longer get a wait state (TiTAN Overdrive 2).
 - The VDP FIFO lookahead index wraps at four entries, and the debug register (`C0001C`) masks planes as described in Kabuto's notes.
 - FM sound: SSG-EG envelopes that end on a quiet hold go silent and the DAC offsets follow the YM2612 die, as in Nuked OPN2.
+- Both SH-2s come from the current Saturn core: interrupt priority, exceptions, cache, multiplier and bus timing fixes found with the sh2test and sstests suites.
 
-The SVP, Pier Solar, Z80, 68000 and VDP changes are also on their own branches based on the official core, without savestates.
+The SVP, Pier Solar, Z80, 68000, VDP and SH-2 changes are also on their own branches based on the official core, without savestates.
 
 ### Building
 

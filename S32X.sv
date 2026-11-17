@@ -1826,10 +1826,11 @@ end
 //////////////////////////////  Savestates  ////////////////////////////////////
 // The Mega Drive side and the 32X side (two SH-2, adapter, 32X VDP, palette, 32X SDRAM
 // and framebuffers). Mega Drive games carry the idle 32X side too.
-// Changing a region offset or size requires an SS_VERSION bump.
+// Changing a region offset or size, or the layout inside a region (the SH-2 flop
+// chains, for instance), requires an SS_VERSION bump.
 
 localparam [31:0] SS_MAGIC   = 32'h33325353;  // "32SS"
-localparam [31:0] SS_VERSION = 32'h00000005;
+localparam [31:0] SS_VERSION = 32'h00000006;
 
 // Region sizes are in 32-bit words: one native byte or 16-bit value per word.
 localparam [31:0] SS_HEADER_SIZE    = 32'd2;

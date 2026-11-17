@@ -58,19 +58,19 @@ module SH7604_DMAC (
 	DMAOR_t     DMAOR;
 	
 	// Savestate chain: request, arbiter, transfer, registers, then SS_SI. REG_DO is dead
-	// at the park (consumed by the CE_R after it is latched); DRCR is never written
-	// (REG1_SEL is always false); DMAOR.AE never sets and DMAOR.NMIF needs NMI_N, tied
-	// high on the 32X; CH_REQ_CLR and DMA_REQ_CLR clear on the clock after they set.
+	// at the park (consumed by the CE_R after it is latched); DMAOR.AE never sets and
+	// DMAOR.NMIF needs NMI_N, tied high on the 32X; CH_REQ_CLR and DMA_REQ_CLR clear on
+	// the clock after they set.
 `define SS_DMAC_REQ {DREQ0_REQ, DREQ1_REQ, DREQ0_OLD, DREQ1_OLD, CH_REQ[0], CH_REQ[1]}
 `define SS_DMAC_ARB {DMA_REQ, DMA_CH, RB_PRIO}
 `define SS_DMAC_XFR {SAR[0], SAR[1], DAR[0], DAR[1], TCR[0], TCR[1], CHCR[0][15:0], CHCR[1][15:0], \
                      CHCR_TE_OLD[0], CHCR_TE_OLD[1], DMA_WR, DMA_RD, DMA_BURST, DMA_LOCK, \
                      RD_BUF[0], RD_BUF[1], RD_BUF[2], RD_BUF[3], LW_CNT, SA_BA, RD_BUF_LATCH}
-`define SS_DMAC_REG {VCRDMA0.VC, VCRDMA1.VC, DMAOR.PR, DMAOR.DME}
+`define SS_DMAC_REG {DRCR[0].RS, DRCR[1].RS, VCRDMA0.VC, VCRDMA1.VC, DMAOR.PR, DMAOR.DME}
 	wire [  6+31:0] ss_req;
 	wire [  3+31:0] ss_arb;
 	wire [347+31:0] ss_xfr;
-	wire [ 18+31:0] ss_reg;
+	wire [ 22+31:0] ss_reg;
 		
 	function bit [3:0] BAFromAddr(input bit [1:0] addr, input bit [1:0] sz);
 		bit [3:0] res;
@@ -96,7 +96,7 @@ module SH7604_DMAC (
 		return res;
 	endfunction
 	
-	wire REG1_SEL = (IBUS_A == 32'hFFFFFE71 && IBUS_A == 32'hFFFFFE72);
+	wire REG1_SEL = (IBUS_A >= 32'hFFFFFE71 && IBUS_A <= 32'hFFFFFE72);
 	wire REG2_SEL = (IBUS_A >= 32'hFFFFFF80 && IBUS_A <= 32'hFFFFFFB3);
 
 	wire CH_EN[2] = '{DMAOR.DME & CHCR[0].DE, DMAOR.DME & CHCR[1].DE};
@@ -254,18 +254,18 @@ module SH7604_DMAC (
 					if (&CHCR[DMA_CH].TS || CHCR[DMA_CH].SM == 2'b01) SAR[DMA_CH] <= SAR[DMA_CH] + AR_INC;
 					else if                (CHCR[DMA_CH].SM == 2'b10) SAR[DMA_CH] <= SAR[DMA_CH] - AR_INC;
 					
-					if (!CHCR[DMA_CH].TA && !LW_CNT) begin
+					if (!CHCR[DMA_CH].TA && (LW_CNT == 2'd0)) begin
 						DMA_RD <= 0;
 						DMA_WR <= 1;
 						DMA_BURST <= &CHCR[DMA_CH].TS;
 						DMA_LOCK <= CHCR[DMA_CH].TB | &CHCR[DMA_CH].TS;
 						LW_CNT <= &CHCR[DMA_CH].TS ? 2'd3 : 2'd0;
 						CH_REQ_CLR[DMA_CH] <= 1;
-						if (!TCR_NEXT) begin
+						if (TCR_NEXT == 24'd0) begin
 							DMA_LOCK <= 0;
 						end
 					end
-					else if (CHCR[DMA_CH].TA && !CHCR[DMA_CH].AM && !LW_CNT) begin
+					else if (CHCR[DMA_CH].TA && !CHCR[DMA_CH].AM && (LW_CNT == 2'd0)) begin
 						CH_REQ_CLR[DMA_CH] <= 1;
 						DMA_REQ_CLR <= 1;
 						LW_CNT <= &CHCR[DMA_CH].TS ? 2'd3 : 2'd0;
@@ -273,7 +273,7 @@ module SH7604_DMAC (
 						if (!CHCR[DMA_CH].TB) DMA_RD <= 0;
 						
 						TCR[DMA_CH] <= TCR_NEXT;
-						if (!TCR_NEXT) begin
+						if (TCR_NEXT == 24'd0) begin
 							CHCR[DMA_CH].TE <= 1;
 							DMA_RD <= 0;
 							DMA_BURST <= 0;
@@ -289,7 +289,7 @@ module SH7604_DMAC (
 					if (LW_CNT == 2'd1) begin
 						if (!CHCR[DMA_CH].TB) DMA_LOCK <= 0;
 					end 
-					if (!LW_CNT || !TCR_NEXT) begin
+					if ((LW_CNT == 2'd0) || (TCR_NEXT == 24'd0)) begin
 						if (!CHCR[DMA_CH].TA) begin
 							DMA_WR <= 0;
 							if (CHCR[DMA_CH].TB) begin
@@ -313,7 +313,7 @@ module SH7604_DMAC (
 					if (TCR_NEXT == 24'd1) begin
 						if (&CHCR[DMA_CH].TS) DMA_LOCK <= 0;
 					end
-					if (!TCR_NEXT) begin
+					if (TCR_NEXT == 24'd0) begin
 						CHCR[DMA_CH].TE <= 1;
 						DMA_RD <= 0;
 						DMA_WR <= 0;
@@ -321,7 +321,7 @@ module SH7604_DMAC (
 					end
 				end
 				
-				if (LW_CNT) LW_CNT <= LW_CNT - 2'd1;
+				if (LW_CNT != 2'd0) LW_CNT <= LW_CNT - 2'd1;
 				else LW_CNT <= &CHCR[DMA_CH].TS ? 2'd3 : 2'd0;
 					
 				RD_BUF[1] <= RD_BUF[0];
@@ -362,6 +362,7 @@ module SH7604_DMAC (
 					case ({IBUS_A[5:2],2'b00})
 						6'h0C: CHCR_TE_OLD[0] <= CHCR[0].TE;
 						6'h1C: CHCR_TE_OLD[1] <= CHCR[1].TE;
+						default:;
 					endcase
 				end
 			end
@@ -425,7 +426,7 @@ module SH7604_DMAC (
 			// synopsys translate_on
 		end
 		else if (SS_SHIFT) begin
-			`SS_DMAC_REG <= ss_reg[17:0];
+			`SS_DMAC_REG <= ss_reg[21:0];
 		end
 		else if (CE_R) begin
 			if (!RES_N) begin
@@ -492,7 +493,7 @@ module SH7604_DMAC (
 	
 	assign ss_req = {`SS_DMAC_REQ, ss_arb[3+31:3]};
 	assign ss_arb = {`SS_DMAC_ARB, ss_xfr[347+31:347]};
-	assign ss_xfr = {`SS_DMAC_XFR, ss_reg[18+31:18]};
+	assign ss_xfr = {`SS_DMAC_XFR, ss_reg[22+31:22]};
 	assign ss_reg = {`SS_DMAC_REG, SS_SI};
 	assign SS_SO  = ss_req[6+31:6];
 `undef SS_DMAC_REQ
