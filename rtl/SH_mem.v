@@ -196,11 +196,11 @@ module CACHE_TAG (
 	q);
 
 	input	  clock;
-	input	[19:0]  data;
+	input	[18:0]  data;
 	input	[5:0]  rdaddress;
 	input	[5:0]  wraddress;
 	input	  wren;
-	output	[19:0]  q;
+	output	[18:0]  q;
 `ifndef ALTERA_RESERVED_QIS
 // synopsys translate_off
 `endif
@@ -209,8 +209,8 @@ module CACHE_TAG (
 // synopsys translate_on
 `endif
 
-	wire [19:0] sub_wire0;
-	wire [19:0] q = sub_wire0[19:0];
+	wire [18:0] sub_wire0;
+	wire [18:0] q = sub_wire0;
 
 //	altsyncram	altsyncram_component (
 //				.address_a (wraddress),
@@ -230,7 +230,7 @@ module CACHE_TAG (
 //				.clocken1 (1'b1),
 //				.clocken2 (1'b1),
 //				.clocken3 (1'b1),
-//				.data_b ({20{1'b1}}),
+//				.data_b ({19{1'b1}}),
 //				.eccstatus (),
 //				.q_a (),
 //				.rden_a (1'b1),
@@ -252,8 +252,8 @@ module CACHE_TAG (
 //		altsyncram_component.power_up_uninitialized = "FALSE",
 //		altsyncram_component.widthad_a = 6,
 //		altsyncram_component.widthad_b = 6,
-//		altsyncram_component.width_a = 20,
-//		altsyncram_component.width_b = 20,
+//		altsyncram_component.width_a = 19,
+//		altsyncram_component.width_b = 19,
 //		altsyncram_component.width_byteena_a = 1;
 		
 	altdpram	altdpram_component (
@@ -286,7 +286,7 @@ module CACHE_TAG (
 		altdpram_component.rdcontrol_aclr = "OFF",
 		altdpram_component.rdcontrol_reg = "UNREGISTERED",
 		altdpram_component.read_during_write_mode_mixed_ports = "CONSTRAINED_DONT_CARE",
-		altdpram_component.width = 20,
+		altdpram_component.width = 19,
 		altdpram_component.widthad = 6,
 		altdpram_component.width_byteena = 1,
 		altdpram_component.wraddress_aclr = "OFF",
@@ -295,6 +295,70 @@ module CACHE_TAG (
 		altdpram_component.wrcontrol_reg = "INCLOCK";
 
 endmodule
+
+module CACHE_VALID (
+	clock,
+	data,
+	rdaddress,
+	wraddress,
+	wren,
+	q);
+
+	input	  clock;
+	input	[0:0]  data;
+	input	[5:0]  rdaddress;
+	input	[5:0]  wraddress;
+	input	  wren;
+	output	[0:0]  q;
+`ifndef ALTERA_RESERVED_QIS
+// synopsys translate_off
+`endif
+	tri0	  wren;
+`ifndef ALTERA_RESERVED_QIS
+// synopsys translate_on
+`endif
+
+	wire [0:0] sub_wire0;
+	wire [0:0] q = sub_wire0[0:0];
+		
+	altdpram	altdpram_component (
+				.data (data),
+				.inclock (clock),
+				.rdaddress (rdaddress),
+				.wraddress (wraddress),
+				.wren (wren),
+				.q (sub_wire0),
+				.aclr (1'b0),
+				.byteena (1'b1),
+				.inclocken (1'b1),
+				.rdaddressstall (1'b0),
+				.rden (1'b1),
+				//.sclr (1'b0),
+				.wraddressstall (1'b0));
+	defparam
+		altdpram_component.indata_aclr = "OFF",
+		altdpram_component.indata_reg = "INCLOCK",
+		altdpram_component.intended_device_family = "Cyclone V",
+		altdpram_component.lpm_type = "altdpram",
+		altdpram_component.outdata_aclr = "OFF",
+		altdpram_component.outdata_reg = "UNREGISTERED",
+		altdpram_component.power_up_uninitialized = "TRUE",
+		altdpram_component.ram_block_type = "MLAB",
+		altdpram_component.rdaddress_aclr = "OFF",
+		altdpram_component.rdaddress_reg = "UNREGISTERED",
+		altdpram_component.rdcontrol_aclr = "OFF",
+		altdpram_component.rdcontrol_reg = "UNREGISTERED",
+		altdpram_component.read_during_write_mode_mixed_ports = "CONSTRAINED_DONT_CARE",
+		altdpram_component.width = 1,
+		altdpram_component.widthad = 6,
+		altdpram_component.width_byteena = 1,
+		altdpram_component.wraddress_aclr = "OFF",
+		altdpram_component.wraddress_reg = "INCLOCK",
+		altdpram_component.wrcontrol_aclr = "OFF",
+		altdpram_component.wrcontrol_reg = "INCLOCK";
+
+endmodule
+
 
 
 module CACHE_LRU (
