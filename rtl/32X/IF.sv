@@ -197,6 +197,9 @@ module S32X_IF
 	wire CAS0_F = CAS0_N_SYNC == 2'b10;
 	wire LWR_F  = LWR_N_SYNC == 2'b10;
 	wire UWR_F  = UWR_N_SYNC == 2'b10;
+	// The MD strobes come from the bus arbiter in this clock domain: a 32X ROM read starts on
+	// the clock after the CAS0 edge, so that its DTACK reaches the 68000 without a wait state.
+	wire CAS0_F1 = CAS0_N_SYNC[0] & ~CAS0_N;
 	
 	bit [15:0] SHROM_Q;
 	SHROM shrom(.clock(CLK), .address({SHCS0M_N,SHA[10:1]}), .q(SHROM_Q));
@@ -880,7 +883,7 @@ module S32X_IF
 			if (SH_ROM_SEL && !SHBS_N && CE_F) begin
 				SH_ROM_WAIT <= 1;
 			end
-			if (MD_32XROM_SEL && !AS_N && (LWR_F || UWR_F || CAS0_F)) begin
+			if (MD_32XROM_SEL && !AS_N && (LWR_F || UWR_F || CAS0_F1)) begin
 				MD_ROM_WAIT <= 1;
 			end
 			

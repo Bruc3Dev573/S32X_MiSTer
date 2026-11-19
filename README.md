@@ -33,6 +33,7 @@ A state holds both Mega Drive CPUs, the sound chips, the VDP, both SH-2s, the 32
 - The VDP FIFO lookahead index wraps at four entries, and the debug register (`C0001C`) masks planes as described in Kabuto's notes.
 - FM sound: SSG-EG envelopes that end on a quiet hold go silent and the DAC offsets follow the YM2612 die, as in Nuked OPN2.
 - Both SH-2s come from the current Saturn core: interrupt priority, exceptions, cache, multiplier and bus timing fixes found with the sh2test and sstests suites.
+- 68000 reads from the 32X cartridge ROM take one wait state less, which removes the slowdown in Spider-Man: Web of Fire ([#65](https://github.com/MiSTer-devel/S32X_MiSTer/issues/65)).
 
 The SVP, Pier Solar, Z80, 68000, VDP and SH-2 changes are also on their own branches based on the official core, without savestates.
 
